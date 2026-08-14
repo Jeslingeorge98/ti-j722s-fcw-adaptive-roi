@@ -1,0 +1,519 @@
+# Integration Plan — Adaptive ROI on J722SXH01EVM
+**Platform:** J722SXH01EVM (J722S, 4 TOPS)  
+**Target:** Wire `dynamic_roi` module into the TI Edge AI GStreamer pipeline  
+**Deadline:** September 15, 2026 (Stage 9 validation + Stage 10 manuscript)
+
+---
+
+## Phase 1 — Integration (PC-side, no board needed)
+
+### Step 1: Module Placement
+
+Copy the ROI module into the app tree so it is importable by the pipeline:
+
+```
+apps_python/
+└── roi/
+    ├── __init__.py
+    └── dynamic_roi.py      ← copy from Adaptive_ROI/
+```
+
+- [x] Create `apps_python/roi/` directory
+- [x] Copy `Adaptive_ROI/dynamic_roi.py` → `apps_python/roi/dynamic_roi.py`
+- [x] Create `apps_python/roi/__init__.py`
+
+---
+
+### Step 2: Create `can_interface.py`
+
+This file is missing and required by the pipeline. It must support two modes:
+
+**Mock mode** (offline/bench — no vehicle):
+- Replays a CSV or synthetic trajectory from `synthetic_can_generator.py`
+- Returns `CanSignals` on each call
+
+**Real mode** (on vehicle via python-can):
+- Listens on the CAN bus for arbitration IDs from the DBC file
+- Decodes speed, steering angle, yaw rate, ABS, ESC flags
+- Returns `CanSignals` thread-safely (background reader thread, `get_latest()` API)
+
+**CAN Signal Mapping (update with actual DBC):**
+
+| Signal | Arbitration ID | Byte Layout | Units |
+|--------|----------------|-------------|-------|
+| Speed | 0x100 | [0:2] | 0.01 km/h |
+| Steering Angle | 0x200 | [0:2] | 0.1° |
+| Yaw Rate | 0x300 | [0:2] | 0.01 rad/s |
+| ABS Active | 0x400 | bit 0 | bool |
+| ESC Active | 0x400 | bit 1 | bool |
+
+- [x] Implement `CANSignalReader(mode='mock', csv_path=None)`
+- [x] Implement `CANSignalReader(mode='real', channel='can0', dbc_path=...)`
+- [x] Implement `get_latest()` → `CanSignals`
+- [x] Add mock CSV playback with loop support
+
+---
+
+### Step 3: Modify `edge_ai_class.py`
+
+In `EdgeAIDemo.__init__()`, after the GStreamer pipe is built:
+
+- Read `roi_config` block from the YAML config
+- Build a `CameraIntrinsics` object from it
+- Instantiate `ROIGenerator(camera=cam, isa_enabled=...)`
+- Instantiate `CANSignalReader(mode='mock'|'real', ...)`
+- Pass both into each `InferPipe`
+
+```python
+# In EdgeAIDemo.__init__(), after gst_pipe is created:
+from roi.dynamic_roi import ROIGenerator, CameraIntrinsics
+from can_interface import CANSignalReader
+
+roi_cfg = config.get("roi_config", {})
+cam = CameraIntrinsics(
+    focal_px=roi_cfg["camera"]["focal_length_px"],
+    principal_x_px=roi_cfg["camera"]["principal_point_x_px"],
+    principal_y_px=roi_cfg["camera"]["principal_point_y_px"],
+    image_width_px=roi_cfg["camera"]["image_width_px"],
+    image_height_px=roi_cfg["camera"]["image_height_px"],
+    mount_height_m=roi_cfg["camera"]["mounting_height_m"],
+)
+self.roi_generator = ROIGenerator(camera=cam, isa_enabled=roi_cfg.get("isa_enabled", True))
+self.can_reader = CANSignalReader(mode=roi_cfg.get("can_mode", "mock"))
+```
+
+- [x] Add `roi_config` parsing in `__init__()`
+- [x] Instantiate `ROIGenerator` and `CANSignalReader`
+- [x] Pass both to `InferPipe` constructor
+
+---
+
+### Step 4: Modify `infer_pipe.py`
+
+In `pipeline()`, before `pull_tensor()`, replace the static crop with a dynamic ROI call:
+
+```python
+# Before (static):
+crop = self.sub_flow.model.crop
+
+# After (dynamic):
+can_sig   = self.can_reader.get_latest()
+lane_info = self._get_latest_lane_info()    # see Step 5
+roi = self.roi_generator.step(
+    lane_info, can_sig, self.fallback_roi, objects=self._get_latest_objects()
+)
+crop = [roi.x_left, roi.x_left + roi.width, roi.y_top, roi.y_top + roi.height]
+
+# Log for debug
+if self.sub_flow.debug_config:
+    print(f"ROI L{roi.roi_level} | area={roi.width*roi.height:.2f} | "
+          f"warmed={roi.is_warmed_up} | implausible_spd={roi.speed_was_implausible}")
+```
+
+- [x] Accept `roi_generator` and `can_reader` in `InferPipe.__init__()`
+- [x] Call `roi_generator.step()` per frame in `pipeline()`
+- [x] Pass dynamic crop to `pull_tensor()`
+- [x] Log `roi_level`, `is_warmed_up`, `speed_was_implausible` per frame
+- [x] Fix `type(input_img) == type(None)` → `input_img is None` (minor cleanup)
+
+---
+
+### Step 5: Feed Lane + Detection Results Back to ROI
+
+The ROI uses **previous-frame** results (avoids circular dependency — per Section 3.2 of review_note.pdf). In `post_pipeline()`, after `post_proc(frame, result)`:
+
+- Extract `LaneInfo` from UFLDv2 output (center_norm, width_norm, confidence, c2_curvature)
+- Extract `DetectedObject[]` from detection output
+- Store both on `self` behind a lock so `pipeline()` reads them next frame
+
+```python
+# In post_pipeline(), after post_proc():
+with self._roi_lock:
+    self._latest_lane_info = _extract_lane_info(out_frame, result)
+    self._latest_objects   = _extract_detections(result, self.sub_flow.model)
+```
+
+- [x] Add `threading.Lock()` for lane/detection state
+- [x] Implement `_extract_lane_info()` from UFLDv2 output → `LaneInfo`
+- [x] Implement `_extract_detections()` from detection output → `DetectedObject[]`
+- [x] Add `_get_latest_lane_info()` and `_get_latest_objects()` helper methods
+
+---
+
+### Step 6: Create `configs/fcw_with_roi.yaml`
+
+Extend `object_detection.yaml` with an `roi_config` block:
+
+```yaml
+title: FCW with Adaptive ROI — J722SXH01EVM
+
+roi_config:
+  camera:
+    focal_length_px: 400.0          # TBD: update from calibration
+    image_width_px: 1280
+    image_height_px: 720
+    mounting_height_m: 1.5
+    principal_point_x_px: 640
+    principal_point_y_px: 360
+  isa_enabled: true
+  can_mode: mock                    # switch to 'real' on vehicle
+  can_csv: test_can.csv             # used only in mock mode
+```
+
+- [x] Create `configs/fcw_with_roi.yaml`
+- [x] Fill camera intrinsics from `camera_calibration_c270.json`
+- [x] Set `can_mode: mock` for initial testing
+
+---
+
+## Phase 2 — Testing (PC-side, before touching the board)
+
+### Step 7: Unit Tests — ROI Module Standalone
+
+```bash
+cd Adaptive_ROI
+python -m pytest test_vectors.py -v          # 133 tests must pass
+python validate_stage9.py                    # 12 scenarios, verify ≥ 95% floor recall
+```
+
+After copying to `apps_python/roi/`, re-run to confirm nothing broke in the move:
+
+```bash
+cd apps_python
+python -m pytest roi/test_vectors.py -v
+```
+
+- [ ] All 133 test vectors pass in original location
+- [ ] All 133 test vectors pass after module move
+- [ ] `validate_stage9.py` reports floor recall ≥ 95%
+
+---
+
+### Step 8: Integration Smoke Test — Mock CAN, No GStreamer
+
+Write a minimal script (`tests/test_roi_integration_smoke.py`) that:
+1. Creates `ROIGenerator` + `CANSignalReader(mode='mock')`
+2. Replays 50 frames of synthetic CAN
+3. Prints ROI per frame and asserts floor containment each frame
+4. No GStreamer dependency — runs on any Linux PC
+
+```bash
+python tests/test_roi_integration_smoke.py
+```
+
+- [ ] Script created
+- [ ] Runs without GStreamer
+- [ ] Floor containment asserted per frame
+- [ ] No exceptions over 50 frames
+
+---
+
+### Step 9: Full Pipeline Test — Mock CAN + Video File
+
+```bash
+python apps_python/app_edgeai.py \
+    --config configs/fcw_with_roi.yaml \
+    --verbose
+```
+
+Verify:
+- ROI changes per frame (not frozen)
+- No crash over full video
+- FPS printed in report
+- ROI level distribution logged
+
+- [ ] Pipeline runs to EOS without crash
+- [ ] ROI is dynamic (varies frame-to-frame)
+- [ ] FPS ≥ 25 on PC (board target is ≥ 30)
+- [ ] `roi_level` distribution in log shows mix of L0/L1/L2
+
+---
+
+### Step 10: Visual ROI Overlay Verification
+
+Add a debug draw of the ROI rectangle onto the output frame. Visually confirm:
+
+| Condition | Expected behaviour |
+|-----------|-------------------|
+| Low speed (< 30 km/h) | Small ROI, near field |
+| High speed (> 80 km/h) | Larger ROI, far field |
+| Left curve | ROI shifts left |
+| Right curve | ROI shifts right |
+| Lane dropout | ROI widens (CAN fallback) |
+| Level 3 (both fail) | Full frame |
+| Vehicle in corridor | ROI expands around vehicle |
+
+- [ ] ROI rectangle drawn on output frame
+- [ ] All 7 visual conditions verified by eye
+
+---
+
+### Step 11: Fix Hard-Braking Floor Failure (Known Issue)
+
+The `highway_hard_braking` scenario currently reports **30% floor recall** (3/10 frames). This must be fixed before vehicle testing — 30% on a safety property is not acceptable.
+
+**Root cause:** `ABS_ACTIVE_VERTICAL_MARGIN_M = 1.0 m` is insufficient at rapid speed changes.
+
+**Fix options to evaluate:**
+- Increase to `2.0–3.0 m` (simplest)
+- Make velocity-dependent: `margin = 1.0 + 0.05 * speed_mps`
+- Re-run `validate_stage9.py` after each change until hard-braking recall ≥ 95%
+
+- [ ] Root cause confirmed
+- [ ] Fix implemented in `dynamic_roi.py`
+- [ ] `highway_hard_braking` floor recall ≥ 95%
+- [ ] All other scenarios unaffected (re-run full Stage 9)
+
+---
+
+## Phase 3 — On-Board Validation (J722SXH01EVM)
+
+**Board SSH:** `ssh root@172.16.73.52`  
+**App path:** `/opt/edgeai_fcw_modified`
+
+### Step 12: Deploy to Board
+
+```bash
+# From PC — sync app to board
+scp -r apps_python/ root@172.16.73.52:/opt/edgeai_fcw_modified/
+scp configs/fcw_with_roi.yaml root@172.16.73.52:/opt/edgeai_fcw_modified/configs/
+```
+
+- [ ] App deployed
+- [ ] `python3 -c "from roi.dynamic_roi import ROIGenerator; print('OK')"` succeeds on board
+
+---
+
+### Step 13: Latency Profiling (Target: < 10 ms per frame)
+
+Wrap `roi_generator.step()` with a timer on the board:
+
+```python
+import time
+t0 = time.perf_counter()
+roi = self.roi_generator.step(...)
+roi_ms = (time.perf_counter() - t0) * 1000
+print(f"ROI compute: {roi_ms:.2f} ms")
+```
+
+Expected: ~0.1 ms (pure Python arithmetic). Confirm no spikes above 1 ms.
+
+- [ ] Mean ROI compute latency < 1 ms
+- [ ] Max observed latency < 10 ms
+- [ ] No latency spikes on curve transitions or object entry
+
+---
+
+### Step 14: FPS Verification (Target: ≥ 30 FPS)
+
+Check `sub_flow.report` output on board:
+
+```bash
+python3 app_edgeai.py --config configs/fcw_with_roi.yaml --verbose
+```
+
+- [ ] FPS ≥ 30 with adaptive ROI enabled
+- [ ] Compare FPS to baseline (static crop) — overhead should be < 1 FPS
+
+---
+
+### Step 15: Floating-Point Consistency Check
+
+Run `validate_stage9.py` on the board to confirm ARM vs x86 results match:
+
+```bash
+python3 Adaptive_ROI/validate_stage9.py
+```
+
+- [ ] Floor recall ≥ 95% on board (same as PC)
+- [ ] Level distribution within ±1% of PC results
+
+---
+
+### Step 16: Real CAN Integration (On Vehicle)
+
+- Switch `can_mode: real` in `fcw_with_roi.yaml`
+- Update CAN arbitration IDs from actual vehicle DBC file
+- Start CAN interface: `ip link set can0 up type can bitrate 500000`
+
+```bash
+python3 app_edgeai.py --config configs/fcw_with_roi.yaml --verbose
+```
+
+Verify in log:
+- `speed_kmh` tracking vehicle speedo
+- `steering_angle_deg` responding to wheel input
+- No `speed_was_implausible=True` during normal driving
+- `roi_level` at L0 during normal conditions
+
+- [ ] CAN signals received and decoded correctly
+- [ ] Speed matches vehicle speedo
+- [ ] No implausible speed flags during normal driving
+- [ ] ROI visually responsive to steering input
+
+---
+
+### Step 17: Live Stage 9 Measurements (Manuscript Metrics)
+
+Collect the four citable metrics on real recorded drives:
+
+| Metric | Target | Measurement method |
+|--------|--------|--------------------|
+| Floor coverage recall | ≥ 95% | Log `floor_contained` per frame, aggregate |
+| Object containment: adaptive vs fixed | Adaptive ≥ static in-corridor recall | Log per-object containment |
+| Mean adaptive region area | < 60% of frame | Log `roi.width * roi.height` per frame |
+| ROI compute latency | < 10 ms | `time.perf_counter()` around `step()` |
+
+- [ ] Logging infrastructure in place (CSV or JSON per frame)
+- [ ] ≥ 10 minutes of real driving data recorded
+- [ ] All 4 metrics computed and within targets
+- [ ] Results written to `Adaptive_ROI/stage9_results_hardware.txt`
+
+---
+
+## Completion Checklist
+
+| Phase | Steps | Status |
+|-------|-------|--------|
+| Integration — module + config | 1 ✅, 2 ✅, 6 ✅ | ✅ Done |
+| Integration — pipeline wiring | 3 ✅, 4 ✅, 5 ✅ | ✅ Done |
+| Testing — unit + smoke | 7, 8 | ⬜ Not Started |
+| Testing — full pipeline + visual | 9, 10 | ⬜ Not Started |
+| Testing — fix hard-braking | 11 | ⬜ Not Started |
+| On-board — deploy + latency + FPS | 12, 13, 14 | ⬜ Not Started |
+| On-board — ARM consistency | 15 | ⬜ Not Started |
+| On-vehicle — CAN integration | 16 | ⬜ Not Started |
+| On-vehicle — live Stage 9 metrics | 17 | ⬜ Not Started |
+
+---
+
+**Last updated:** August 13, 2026  
+**Board:** J722SXH01EVM — SSH `root@172.16.73.52`  
+**SAE Deadline:** September 15, 2026
+
+---
+
+## Step-by-Step Explanations
+
+### Step 1: Module Placement
+
+The `roi/` directory makes `dynamic_roi.py` importable as a proper Python package (`from roi.dynamic_roi import ...`) by any file inside `apps_python/`. Without this, none of the downstream steps can import the ROI logic. The `__init__.py` marks the directory as a package. This is a pure file placement step — no logic changes.
+
+---
+
+### Step 2: `can_interface.py`
+
+The `ROIGenerator` adapts the ROI based on vehicle state every frame. It needs speed, steering angle, yaw rate, ABS, and ESC signals as `CanSignals` objects. `can_interface.py` is the adapter that provides these.
+
+**Why two modes:**
+- **Mock mode** — replays a CSV file row-by-row (one row per frame, loops at end). Used when there is no vehicle or CAN bus available — e.g., testing against a pre-recorded video on PC. The CSV columns are `speed_kmh`, `steering_angle_deg`, `yaw_rate_dps`, `steering_valid`, `yaw_rate_valid`, `abs_active`, `esc_active`. Only `speed_kmh` is required; the rest default to safe neutral values.
+- **Real mode** — a background daemon thread listens on `can0` via `python-can`, decodes messages using the fixed arbitration IDs from the integration plan, and updates `_latest` under a lock. `get_latest()` is non-blocking and thread-safe, so the GStreamer pipeline thread never stalls waiting for CAN.
+
+**CAN signal mapping (real mode):**
+
+| Arbitration ID | Byte layout | Scale | Output field |
+|---|---|---|---|
+| 0x100 | [0:2] uint16 big-endian | × 0.01 → km/h ÷ 3.6 | `speed_mps` |
+| 0x200 | [0:2] int16 big-endian | × 0.1 | `steering_angle_deg` |
+| 0x300 | [0:2] int16 big-endian | × 0.01 rad/s → deg/s | `yaw_rate_dps` |
+| 0x400 | byte 0 bit 0 | bool | `abs_active` |
+| 0x400 | byte 0 bit 1 | bool | `esc_active` |
+
+**Testing without real CAN data:** A constant neutral CSV (e.g., 60 km/h, steering = 0°) is sufficient for pipeline integration tests. Speed-based ROI scaling still exercises the system; lane curvature from UFLDv2 (Step 5) handles the geometric adaptation.
+
+---
+
+### Step 3: Modify `edge_ai_class.py`
+
+`EdgeAIDemo` is the top-level owner of configuration parsing. It reads the YAML, builds models, inputs, outputs, and the GStreamer pipeline. Step 3 adds ROI and CAN construction immediately after the GStreamer pipe is built, before `InferPipe` objects are created.
+
+**Why here, not inside `InferPipe`:**
+- `ROIGenerator` and `CANSignalReader` represent global vehicle + camera state, not per-model state. All inference pipes on the same camera share one ROI generator and one CAN reader. Creating one per pipe would advance the CSV replay independently per pipe, desynchronising signals.
+- `EdgeAIDemo` already owns config parsing — it's the natural place to read `roi_config`.
+
+**What `roi_config` is:** A new block in the YAML that carries camera intrinsics (from `camera_calibration_c270.json`) and CAN settings. Camera values are pulled from the calibration JSON; `mounting_height_m` is a physical tape-measure value (1.58 m for the mock video setup, to be updated with actual vehicle measurement). Both objects are passed down to every `InferPipe` at construction.
+
+**Backward compatibility:** If the YAML has no `roi_config` block, `roi_generator` and `can_reader` are both `None`. Existing configs work unchanged.
+
+---
+
+### Step 4: Modify `infer_pipe.py` — Per-Frame ROI Computation
+
+`pipeline()` is Stage 1 of the two-stage inference loop. It pulls the pre-processed tensor, runs inference, and enqueues the result for Stage 2. Step 4 inserts the ROI computation between the start of each iteration and the `pull_tensor()` call.
+
+**What changes:**
+- `self.fallback_roi` — a full-frame `ROIParameters(x_left=0, y_top=0, width=1, height=1)` built once at init. This is what the ROI expands to when both CAN and lane fail simultaneously (Level 3).
+- `self._current_roi` — updated every frame with the latest `ROIParameters`. Step 5 (coordinate unmapping) and Step 10 (visualization) read from this.
+- Per frame: `can_reader.get_latest()` → `roi_generator.step()` → store result → log ROI level, warmup state, implausible speed flag.
+
+**Why `model.crop` dimensions don't change:** `pull_tensor()` takes `width, height` — the model's fixed input resolution (e.g., 416 × 416 for YOLOX). These are tensor dimensions, not source frame crop coordinates. The ROI is stored in normalized [0, 1] coordinates and used for coordinate mapping and visualization. Dynamic GStreamer-level windowing (sending a different region of the camera frame to the model) is a deeper change deferred to the board testing phase.
+
+**Guard:** If `roi_generator` is `None` (no `roi_config` in YAML), the entire ROI block is skipped. The pipeline behaves identically to the original.
+
+**Minor cleanup:** Both `type(x) == type(None)` checks replaced with `x is None`.
+
+---
+
+### Step 5: Feed Lane and Detection Results Back to ROI
+
+`roi_generator.step()` uses two inputs: CAN signals (Step 4) and previous-frame lane/detection results (Step 5). Without Step 5, the ROI adapts only to speed and steering — it has no knowledge of where the lanes or vehicles actually are in the video.
+
+**The circular dependency and why previous-frame results are used:**
+The ROI must be computed *before* inference runs (to define what region to process). Frame N's lane output doesn't exist yet when frame N's ROI is computed. The solution is a one-frame lag:
+
+```
+Frame N:  pipeline()      reads  _latest_lane_info  (written from frame N-1)
+                          computes ROI → runs inference → enqueues result
+          post_pipeline() decodes result N → writes _latest_lane_info (for frame N+1)
+```
+
+This is deliberate and correct — documented in Section 3.2 of the review note.
+
+**The two-thread write/read pattern:**
+`pipeline()` and `post_pipeline()` run concurrently. A dedicated `_feedback_lock` protects `_latest_lane_info` and `_latest_objects` from races. The existing `_roi_lock` protects `_current_roi` separately (written by pipeline, read by visualization/Step 10).
+
+**What `_extract_lane_info()` computes from UFLDv2 output:**
+- `center_norm` — normalized horizontal midpoint of the ego lane (average of left and right lane x-positions)
+- `width_norm` — normalized distance between left and right lane
+- `confidence` — fraction of row anchors with valid detections
+- `c2_curvature` — road curvature (1/m) fitted from the lane point geometry
+
+Rather than duplicating UFLDv2 decode logic, the extractor borrows the already-loaded row/col anchors from the `PostProcessLaneDetection` instance.
+
+**What `_extract_detections()` computes from detection output:**
+Runs the same bbox decode as `PostProcessDetection` (concatenate tensors, normalize, threshold) and wraps each passing detection into a `DetectedObject` with normalized `bbox`, `obj_class`, and `confidence`. These are the objects fed to `ROIGenerator.step()` for vehicle-corridor expansion.
+
+---
+
+### Step 6: Create `configs/fcw_with_roi.yaml`
+
+`fcw_with_roi.yaml` is the single entry point that wires together the video source, the two-model pipeline (UFLDv2 + YOLOX-nano), the display sink, and the new `roi_config` block that Steps 3–5 read at startup.
+
+**Why a new file instead of editing `object_detection.yaml`:**
+FCW needs both a lane detection model (UFLDv2 on C7x_1) and an object detection model overlaid by the lane post-process (YOLOX-nano on C7x_0). `od_ld_culane_overlay.yaml` was the closest existing config and was used as the structural reference. Creating a separate file leaves all existing configs untouched, and makes it immediately obvious which config to pass when running the FCW pipeline.
+
+**Camera intrinsics — where the values came from:**
+All four values were read directly from `apps_python/camera_calibration_c270.json`, which was produced by a checkerboard calibration of the Logitech C270 at 1280×720:
+
+| Parameter | Source field | Value used |
+|-----------|-------------|-----------|
+| `focal_length_px` | mean(`fx_px`, `fy_px`) = mean(1406.72, 1408.83) | 1407.8 |
+| `principal_point_x_px` | `cx_px` | 636.0 |
+| `principal_point_y_px` | `cy_px` | 350.4 |
+| `image_width_px` / `image_height_px` | `image_size` | 1280 × 720 |
+
+A single `focal_length_px` is used because `CameraIntrinsics` (in `dynamic_roi.py`) models a pinhole camera with one focal length. `fx` and `fy` from the calibration differ by only 2 px (sub-pixel), so averaging them introduces no meaningful error in the ROI geometry.
+
+**Why `image_width_px: 1280, image_height_px: 720` even though the source video is 1914×1075:**
+The calibration was performed at 1280×720. GStreamer scales the source video down to the configured input resolution (1280×720) before any processing happens. The ROI generator operates in the calibrated coordinate space, so all geometry stays consistent.
+
+**Video and CAN source:**
+- Video: `/home/jeslin/Indian_conditions/indian_road1.webm` — Indian road footage, 1914×1075 native, scaled to 1280×720 by GStreamer, looped for testing.
+- CAN CSV: `/home/jeslin/Indian_conditions/can_signals_indian_road1.csv` — seven-column mock signal file (`speed_kmh`, `steering_angle_deg`, `yaw_rate_dps`, `steering_valid`, `yaw_rate_valid`, `abs_active`, `esc_active`) replayed row-by-row by `CANSignalReader(mode='mock')`.
+
+**Flow crop `[0, 0, 1280, 720]`:**
+The static crop in the flow definition is set to the full frame. This value is overridden per frame by `infer_pipe.py` (Step 4) once the adaptive ROI is computed. It acts as a safe fallback only if `roi_generator` is `None`.
+
+**What still needs updating before vehicle testing:**
+- `mounting_height_m: 1.5` — placeholder. Must be replaced with the actual camera mount height measured on the vehicle (tape measure from road surface to camera lens centre).
+- `can_mode: mock` → `can_mode: real` and update arbitration IDs from the vehicle DBC file (Step 16).

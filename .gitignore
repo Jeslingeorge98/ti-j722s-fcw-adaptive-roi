@@ -1,0 +1,60 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and runtime output
+*.log
+logs/
+output/
+outputs/
+results/
+runs/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Build/package output
+build/
+dist/
+*.egg-info/
+
+# Large AI model files—enable if models should not be committed
+*.onnx
+*.tflite
+*.pth
+*.pt
+*.bin

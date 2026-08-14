@@ -1,0 +1,56 @@
+title: "FCW with Adaptive ROI — J722SXH01EVM"
+
+log_level: 2
+
+# ---------------------------------------------------------------------------
+# roi_config — read by EdgeAIDemo.__init__() to build ROIGenerator + CANSignalReader
+# Camera intrinsics from apps_python/camera_calibration_c270.json (1280x720 calibration)
+# focal_length_px: mean(fx_px, fy_px) = mean(1406.72, 1408.83)
+# ---------------------------------------------------------------------------
+roi_config:
+  camera:
+    focal_length_px: 1407.8
+    principal_point_x_px: 636.0
+    principal_point_y_px: 350.4
+    image_width_px: 1280
+    image_height_px: 720
+    mounting_height_m: 1.5       # update with tape measure on actual vehicle
+  isa_enabled: true
+  can_mode: mock
+  can_csv: /home/jeslin/Indian_conditions/can_signals_indian_road1.csv
+
+inputs:
+  input0:
+    source: /home/jeslin/Indian_conditions/indian_road1.webm
+    format: auto
+    width: 1280
+    height: 720
+    framerate: 30
+    loop: True
+
+models:
+  # UFLDv2 lane detection — C7x_1 (core_id 2)
+  # YOLOX-nano object detection overlaid by lane post-process — C7x_0 (core_id 1)
+  model0:
+    model_path: /opt/model_zoo/LD-ufldv2-culane-exp01-res18-256x640
+    viz_threshold: 0.6
+    core_id: 2
+    overlay_detection_model: /opt/model_zoo/ONR-OD-8200-yolox-nano-lite-mmdet-coco-416x416
+    overlay_detection_threshold: 0.4
+    overlay_detection_core: 1
+
+outputs:
+  output0:
+    sink: kmssink
+    width: 1920
+    height: 1080
+    overlay-perf-type: graph
+
+  output1:
+    sink: /opt/online_test_data/output/output_fcw_roi_indian_road1.mkv
+    width: 1280
+    height: 720
+
+flows:
+  # Full-frame crop — dynamic ROI in infer_pipe.py overrides this per frame
+  flow0: [input0, model0, output0, [0, 0, 1280, 720]]
