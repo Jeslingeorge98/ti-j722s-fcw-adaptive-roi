@@ -1,177 +1,54 @@
 """
 Dynamic ROI Generator  —  FCW + Lane + ISA (signals, signs, gantry)
 ====================================================================
-STAGE 1 UPDATE (Foundation): adds camera intrinsics, the physics-based
-stopping-distance calculation, and the invariant collision-coverage
-floor. The vertical region is no longer a hand-tuned heuristic — it is
-derived from ego speed, road curvature, and camera geometry.
+Computes a single normalised ROI every frame covering the forward path,
+traffic signals, roadside signs, and overhead gantries. All coordinates
+are in the fully normalised space [0.0, 1.0] with origin at top-left.
+Output format: (x_left, y_top, width, height, roi_level).
 
-Everything in this file marked "STAGE 2+" is deliberately unchanged
-from the previous version and will be addressed in later stages, per
-the consolidated roadmap in review_note.md.
-
-Enhanced with:
-  • TTC-adaptive ROI scaling for FCW urgency zones
-  • Kalman filter per-track state estimation (BiTrack-compatible)
-  • Track lifecycle management (tentative → confirmed → lost)
-  • STAGE 1: Physics-based invariant collision-coverage floor
-
-Coordinate space : fully normalised [0.0, 1.0]  (origin = top-left)
-ROI output       : (x_left, y_top, width, height, roi_level) — normalised
-Target platform  : L2- ADAS (truck / heavy vehicle), ~4 TOPS accelerator
-
-Design
-------
-A single ROI is returned every frame covering:
-
+ROI zone structure:
   Zone D  Forward path      lane + curvature + speed            (always)
   Zone B  Traffic signals   vertical pull toward horizon         (conf-gated)
   Zone C  Roadside signs    full bbox lateral + vertical         (conf-gated)
   Zone A  Gantry / overhead y_top pulled toward 0.0             (conf-gated)
 
-STAGE 1 — Invariant Collision-Coverage Floor (NEW)
----------------------------------------------------
-  Before any lane-based or object-based logic runs, a minimum region
-  is calculated directly from ego speed, road curvature, and camera
-  geometry — no detections required. This floor guarantees that the
-  road surface from a near cutoff out to the vehicle's stopping
-  distance is always inside the final region.
+Before any lane-based or object-based logic runs, a physics-based
+invariant collision-coverage floor is derived from ego speed, road
+curvature, and camera geometry alone — no detections required. The floor
+guarantees that the road surface from a near-field cutoff out to the
+vehicle's stopping distance is always inside the final region. The final
+base region takes the widest bound, edge by edge, of the physics floor
+and the lane-centred calculation; the floor can only be added to, never
+reduced below, by anything that follows it.
 
-  The final base region is the widest bound, edge by edge, of:
-    (a) this physics-based floor, and
-    (b) the existing lane-centred calculation.
+Degradation levels (surfaced via roi_level, a discretised diagnostic
+label — actual positioning is a continuous confidence-weighted blend):
+  0 — high confidence: full lane-informed centring, floor applied
+  1 — degraded/blended: continuous mix of lane-informed and CAN-only
+      centring, floor applied with confidence-scaled corridor width
+  2 — CAN-only fallback: lateral centring uses CAN curvature only,
+      floor still applied
+  3 — full-frame fallback: dynamics confidence below CONF_LEVEL3_THRESHOLD;
+      returns the entire image, no positioning attempted
 
-  This means the floor can only be added to, never reduced below,
-  by anything that follows it (lane centring, object expansion).
+TTC is estimated per tracked vehicle from Kalman-filtered relative depth
+velocity. Three urgency zones (nominal, warning, critical) map to ROI
+expansion multipliers that inflate OBJECT_MARGIN for FCW vehicles only.
+Vehicle expansion is additionally gated on corridor membership, confirmed
+track state, and a valid closing TTC.
 
-  Grounding for the constants used here:
-    - Warning-time budget (T_TTC_MIN_S = 2.1 s) follows ISO 15623's
-      minimum time-to-collision threshold for a stationary lead
-      vehicle — the most demanding of that standard's three defined
-      scenarios (2.1 s stopped, 2.4 s decelerating, 1.8 s slower-
-      moving), and is broadly consistent with Euro NCAP's AEB test
-      protocol (1.2 s assumed driver-reaction delay) once combined
-      with typical braking response latency.
-    - Base lane width (LANE_WIDTH_STD_M = 3.5 m) follows
-      IRC:SP:73-2015 for Indian National Highways.
-    - The lateral wander allowance and curvature-uncertainty
-      coefficient below are engineering placeholders pending
-      validation against recorded driving data (see review_note.md,
-      Section 4.5 / Section 5.3 "Pending Confirmation" items).
+Each DetectedObject may carry an optional track_id. The tracker maintains
+a KalmanTrack per ID through a TENTATIVE → CONFIRMED → LOST lifecycle.
+If an external tracker (BiTrack / SORT / DeepSORT) is used upstream, set
+use_external_tracker=True; the returned position always trusts the
+external bbox, but an internal Kalman filter still runs to support TTC
+estimation, since the external interface has no field for velocity or TTC.
 
-TTC Integration
----------------
-  TTC is estimated per tracked vehicle from Kalman-filtered relative
-  depth velocity.  Three urgency zones map to ROI expansion multipliers:
-
-    TTC > TTC_WARN_S           : nominal expansion (multiplier = 1.0)
-    TTC_CRIT_S < TTC ≤ TTC_WARN_S : warning zone  (multiplier = TTC_WARN_SCALE)
-    TTC ≤ TTC_CRIT_S           : critical zone    (multiplier = TTC_CRIT_SCALE)
-
-  The multiplier inflates OBJECT_MARGIN for FCW vehicle expansions only.
-
-  STAGE 3 (not yet implemented in this file): expansion should also be
-  gated on corridor membership and a confirmed, valid TTC — currently
-  any detected vehicle above the confidence threshold still expands
-  the region. Tracked as a known, documented gap; see review_note.md.
-
-Tracking Integration
---------------------
-  Each DetectedObject may carry an optional track_id.  The tracker
-  maintains a KalmanTrack per ID with a 4-state model:
-
-    state = [cx, cy, w, h]   (normalised image coordinates)
-    motion model             : constant velocity in cx, cy; constant w, h
-    measurement              : [cx, cy, w, h] from detector
-
-  Track lifecycle:
-    TENTATIVE  : first N_INIT frames — detection confirmed, not yet used
-                 for TTC (avoids ghost-track TTC triggers)
-    CONFIRMED  : hit_streak >= N_INIT — full expansion + TTC applied
-    LOST       : missed >= MAX_AGE    — track deleted
-
-  BiTrack note:
-    This module implements the Kalman state independently.  If BiTrack
-    (or any external SORT/DeepSORT-compatible tracker) is used upstream,
-    set use_external_tracker=True when constructing ROIGenerator.
-    In that mode DetectedObject.track_id carries the external ID, and
-    the POSITION returned downstream is always the raw external bbox
-    (never overwritten by internal filtering). However, an internal
-    Kalman filter STILL RUNS in the background even in external mode —
-    it is fed the external bbox every frame purely so that TTC can
-    still be estimated from it, since the external tracker interface
-    has no field for supplying velocity/TTC directly. CORRECTED
-    2026-08-06: earlier wording here claimed "the internal Kalman step
-    is skipped," which was inaccurate — it is only the RETURNED
-    POSITION that bypasses internal filtering, not the internal
-    velocity/TTC machinery, which continues to run either way.
-
-Vertical rules (STAGE 1 — UPDATED)
------------------------------------
-  y_top / height : derived from the invariant floor (Z_max projection),
-                    combined with the previous lane-based calculation.
-                    Replaces the old fixed SKY_CLIP_Y_TOP / _depth_ratio()
-                    heuristic entirely — see "Deleted in Stage 1" below.
-  y_bottom       : near-field cutoff from the floor's Z_min, clamped to
-                    HOOD_Y_BOTTOM.
-
-Deleted in Stage 1 (previously heuristic, now replaced by the floor)
-----------------------------------------------------------------------
-  SKY_CLIP_Y_TOP, DEPTH_RATIO_BASE, DEPTH_RATIO_MIN, _depth_ratio()
-  FOCAL_NORM_APPROX, OBJECT_REAL_HEIGHT_M
-    — confirmed dead code in the prior version (declared, never used
-      anywhere in the TTC calculation or elsewhere).
-
-Smoothing (STAGE 4 — not yet updated in this file)
-----------------------------------------------------
-  Still the original single-rate IIR with a snap threshold, applied
-  only to (centre_x, width). Known limitations documented in
-  review_note.md Section 2.7 / 4.x — fast-grow/slow-shrink asymmetric
-  filtering is planned but not yet implemented here.
-
-Object expansion (STAGE 3 — not yet updated in this file)
--------------------------------------------------------------
-  Expansion fires only when confidence >= per-category threshold.
-  Thresholds are injectable via ConfidenceGates.
-
-  VEHICLE       lateral + vertical        (FCW; default threshold = 0.0)
-                KNOWN GAP: not yet gated on corridor membership or
-                valid TTC — see review_note.md Stage 3.
-  SIGNAL        vertical only             (threshold = 0.55)
-  SIGN_ROADSIDE lateral + vertical        (threshold = 0.60)
-  SIGN_OVERHEAD y_top toward 0.0 only    (threshold = 0.60)
-
-Degradation levels (surfaced via roi_level) — STAGE 2 IMPLEMENTED
----------------------------------------------------------------------------
-  As of Stage 2, positioning is a CONTINUOUS confidence-weighted blend,
-  not a hard level switch. `roi_level` is retained purely as a
-  discretised diagnostic/logging label, not as branching logic:
-
-  0 — high confidence : overall confidence >= CONF_BLEND_HIGH and
-                          CAN steer/yaw signals valid; full lane-informed
-                          centring, floor applied
-  1 — degraded/blended: confidence between CONF_BLEND_LOW and
-                          CONF_BLEND_HIGH (or CAN dynamics signals
-                          themselves invalid); a continuous mix of
-                          lane-informed and CAN-only centring, floor
-                          applied with dynamics-confidence-scaled
-                          corridor width
-  2 — CAN-only fallback: overall confidence <= CONF_BLEND_LOW; lateral
-                          centring uses CAN curvature only (no lane
-                          trust at all), floor still applied — THIS IS
-                          THE FIX for the previously-documented gap:
-                          CAN curvature now always shifts this fallback,
-                          it is never a frozen/unshifted rectangle
-  3 — full-frame fallback: dynamics confidence itself (not lane
-                          confidence — see _compute_base_roi docstring
-                          for why these are kept separate) below
-                          CONF_LEVEL3_THRESHOLD; returns the entire
-                          image, no positioning attempted
-
-  See _compute_base_roi()'s docstring for the full reasoning behind
-  keeping three separate confidence questions distinct rather than
-  collapsing them into one number.
+The invariant floor concept: the cap on expansions can never intrude into
+the floor — see _apply_area_cap() for how this is guaranteed by
+construction rather than by a runtime check.
 """
+
 
 from __future__ import annotations
 
@@ -189,7 +66,7 @@ from typing import Dict, List, Optional, Tuple
 WHEELBASE_M                  = 5.5    # truck wheelbase [m]
 LANE_WIDTH_M                 = 3.5    # nominal lane width, metric reference [m]
 
-# --- Preview horizon (STAGE 2+: lane-based lateral shift, unchanged) ---
+# --- Preview horizon ---
 PREVIEW_TIME_S               = 0.60   # look-ahead time [s]
 PREVIEW_DIST_MIN_M           = 15.0   # minimum preview distance — truck braking envelope [m]
 MIN_SPEED_FOR_PREVIEW_MPS    = 3.0    # below this speed lateral offset is zeroed [m/s]
@@ -204,7 +81,7 @@ SPEED_DYNAMICS_FLOOR_MPS     = 0.5    # below this speed dynamics are skipped en
 LAT_ACC_DENOM_FLOOR          = 0.5    # floor for speed² in lateral acc limit [m²/s²]
 
 # ==========================================================================
-# STAGE 8B — Cold/hot start: speed plausibility check (NEW, added 2026-08-11)
+# Speed plausibility check constants
 # ==========================================================================
 
 SPEED_ZERO_THRESHOLD_MPS      = 0.5   # a reported speed at or below this is
@@ -216,40 +93,38 @@ YAW_SUGGESTS_MOVING_THRESHOLD_DPS = 2.0  # a yaw rate above this, while
     # speed reads approximately zero, is treated as evidence the
     # vehicle is very likely actually moving — a vehicle rotating
     # meaningfully cannot simultaneously be genuinely at a standstill.
-    # Matches YAW_MISMATCH_MILD_DPS's own threshold (Stage 2), reusing
-    # the same physically-motivated scale rather than inventing a new one.
+    # Reuses the same physically-motivated scale as YAW_MISMATCH_MILD_DPS
+    # rather than introducing a new arbitrary threshold.
 DEFAULT_ASSUMED_SPEED_MPS_ON_IMPLAUSIBLE_ZERO = MAX_SPEED_MPS  # if a
     # near-zero speed reading is judged implausible (see
     # _is_speed_plausible), THIS value is used for every downstream
-    # calculation instead. Deliberately reuses MAX_SPEED_MPS (30 m/s,
-    # ~108 km/h) — an already-existing, already-referenced constant in
-    # this module — rather than introducing a new arbitrary number.
-    # This is a conservative, "assume the worst plausible case" choice:
-    # addresses the specific hazard identified in review_note.md
-    # Section 19.4 — a brief restart while genuinely moving, with CAN
-    # not yet delivering valid speed data, must not be allowed to
-    # produce a floor sized for a stationary vehicle when the vehicle
-    # may actually be travelling at speed.
+    # calculation instead. Reuses MAX_SPEED_MPS (30 m/s, ~108 km/h) —
+    # an already-existing constant in this module — rather than
+    # introducing a new arbitrary number. This is a conservative,
+    # "assume the worst plausible case" choice: a brief restart while
+    # genuinely moving, with CAN not yet delivering valid speed data,
+    # must not be allowed to produce a floor sized for a stationary
+    # vehicle when the vehicle may actually be travelling at speed.
 
 # --- Yaw reliability ---
 YAW_MISMATCH_THRESHOLD_DPS   = 5.0    # max allowed yaw error before fallback to steering [deg/s]
 
 # ==========================================================================
-# STAGE 1 — Camera intrinsics and invariant floor constants (NEW)
+# Camera intrinsics and invariant floor constants
 # ==========================================================================
 
-# --- Warning-time budget, grounded in ISO 15623 (see module docstring) ---
+# --- Warning-time budget, grounded in ISO 15623 ---
 TTC_MIN_WARNING_S             = 2.1    # ISO 15623 stationary-lead-vehicle threshold [s]
 MAX_BRAKING_DECEL_MPS2        = 6.0    # comfortable-to-firm braking deceleration, truck [m/s²]
 Z_NEAR_CUTOFF_M               = 5.0    # near-field cutoff — below this, other sensors cover it [m]
-Z_MIN_FLOOR_DEPTH_M           = 15.0   # minimum (Z_max - Z_near) even at zero speed — found
-                                        # during Stage 1 verification: without this, a stationary
-                                        # vehicle (Z_max formula naturally returns 0) collapses
-                                        # the floor to zero height, which is degenerate/unsafe.
-                                        # A stopped vehicle still needs forward visibility, e.g.
-                                        # to see traffic ahead starting to move again.
+Z_MIN_FLOOR_DEPTH_M           = 15.0   # minimum (Z_max - Z_near) even at zero speed — without
+                                        # this, a stationary vehicle (Z_max formula naturally
+                                        # returns 0) collapses the floor to zero height, which
+                                        # is degenerate/unsafe. A stopped vehicle still needs
+                                        # forward visibility, e.g. to see traffic ahead starting
+                                        # to move again.
 
-# --- Corridor width, grounded in IRC 73 (see module docstring) ---
+# --- Corridor width, grounded in IRC 73 ---
 LANE_WIDTH_STD_M              = 3.5    # IRC:SP:73-2015 standard NH lane width [m]
 LATERAL_WANDER_SIGMA_M        = 0.30   # PENDING CONFIRMATION — placeholder lane-centring
                                         # error; replace with measured LKA performance [m]
@@ -260,33 +135,28 @@ CURVATURE_ERROR_SIGMA_INV_M   = 0.0006 # PENDING CONFIRMATION — placeholder cu
 
 # --- Vertical / pitch handling ---
 CAMERA_PITCH_RAD_DEFAULT      = 0.0    # assumed level camera when no pitch estimate given [rad]
-ABS_ACTIVE_VERTICAL_MARGIN_M  = 1.0    # STAGE 1 fallback: conservative extra vertical
-                                        # margin applied when hard braking is flagged,
-                                        # in lieu of precise pitch estimation (deferred
-                                        # to Future Improvements per review_note.md) [m]
+ABS_ACTIVE_VERTICAL_MARGIN_M  = 1.0    # conservative extra vertical margin applied when
+                                        # hard braking is flagged, in lieu of precise pitch
+                                        # estimation [m]
 
 # --- Optional ISA / gantry vertical extension ---
 GANTRY_HEIGHT_M                = 5.5   # IRC 67 minimum overhead gantry clearance [m]
 GANTRY_MIN_READ_DISTANCE_M     = 30.0  # closest distance a gantry sign must be resolvable [m]
 
 # ==========================================================================
-# STAGE 7 — Sign handling: readability horizon and occlusion response (NEW)
+# Sign handling: readability horizon and occlusion response
 # ==========================================================================
 
 # --- ISA decision-time budget ---
 # Deliberately DIFFERENT from FCW's ISO 15623-grounded TTC_MIN_WARNING_S
 # (2.1s) — reading and reacting to a speed-limit sign is a routine
 # driving task, not an emergency collision response, so the AASHTO
-# perception-reaction reference (2.5s, already discussed and cited in
-# Section 4.4 of review_note.md for a DIFFERENT purpose there) is the
-# appropriate grounding here, not the FCW-specific standard.
+# perception-reaction reference (2.5s) is the appropriate grounding here.
 ISA_REACTION_TIME_S           = 2.5    # AASHTO Green Book perception-reaction reference
 ISA_COMFORTABLE_DECEL_MPS2    = 1.5    # gentle, non-emergency deceleration to a new lower limit
 ISA_MIN_SIGN_PX               = 20.0   # minimum resolvable size for sign classification —
-                                        # consistent with the pixel-budget reasoning discussed
-                                        # earlier in this project (small fixed-class classifier,
-                                        # not general OCR; ~20-30px established as the reliable
-                                        # threshold for distinguishing similar sign values)
+                                        # ~20-30px is the reliable threshold for distinguishing
+                                        # similar sign values in a small fixed-class classifier
 
 # --- IRC 67 reference sign diameters, by design-speed bracket ---
 # Grounded values from IRC:67 (regulatory sign sizing table), kept here
@@ -302,31 +172,26 @@ IRC67_SIGN_DIAMETER_121_150_M  = 1.50
 LARGE_VEHICLE_HEIGHT_THRESHOLD_NORM = 0.12  # bbox height above which a
     # tracked vehicle is treated as "large" (truck/bus-scale, tall
     # enough to plausibly occlude a roadside or overhead sign) rather
-    # than a car. PENDING CONFIRMATION — a reasonable starting estimate
-    # consistent with the scale used throughout this module's test
-    # fixtures; not yet validated against real large-vehicle imagery.
+    # than a car. PENDING CONFIRMATION — a reasonable starting estimate;
+    # not yet validated against real large-vehicle imagery.
 SIGN_MEMORY_MAX_AGE           = 5      # frames a remembered sign's
     # position is still trusted after last being directly seen, before
-    # the occlusion response stops reaching for it. Deliberately reuses
-    # the SAME numeric value as MAX_AGE (vehicle track lifecycle) for
-    # consistency, not because the two concepts must always match.
+    # the occlusion response stops reaching for it.
 OCCLUSION_LATERAL_WIDEN_NORM  = 0.15  # additional lateral half-width
     # margin applied when a large vehicle is judged sign-occluding —
     # approximates reaching toward an opposite-side redundant sign
     # (IRC 67 multi-lane placement requirement) without a precise
-    # distance-based projection, given known limitations in this
-    # module's monocular distance estimation (see Section 12.5's
-    # documented head-on-approach limitation). PENDING CONFIRMATION.
+    # distance-based projection. PENDING CONFIRMATION.
 OCCLUSION_VERTICAL_PEEK_NORM  = 0.06  # additional upward extension
     # (toward smaller y) applied above a large tracked vehicle's bbox,
     # approximating the gap between a typical truck's height and IRC
     # 67's minimum gantry clearance (GANTRY_HEIGHT_M) so an overhead
     # sign partially visible above the vehicle stays inside the region.
     # PENDING CONFIRMATION — a fixed normalised margin rather than a
-    # precise per-frame projection, for the same reason as above.
+    # precise per-frame projection.
 
 # ==========================================================================
-# STAGE 8 — Region size cap and canonical (accelerator) mapping (NEW)
+# Region size cap and canonical (accelerator) mapping
 # ==========================================================================
 
 MAX_ROI_AREA_FRACTION = 0.70   # cap on the FINAL region's area, as a
@@ -338,15 +203,12 @@ MAX_ROI_AREA_FRACTION = 0.70   # cap on the FINAL region's area, as a
     # guaranteed by construction, not merely by a runtime check.
 
 # --- Bounded resize (letterbox padding, not stretching) ---
-# Grounded in the design decision recorded in review_note.md Section
-# 4.3: uniform scaling preserves object proportions; anisotropic
-# stretching would distort them relative to what a detector trained on
-# undistorted images expects. No new tunable constants needed here —
-# the canonical (accelerator) input size is supplied by the caller,
-# since it is a property of the target hardware/model, not of this
-# module.
+# Uniform scaling preserves object proportions; anisotropic stretching
+# would distort them relative to what a detector trained on undistorted
+# images expects. The canonical (accelerator) input size is supplied by
+# the caller, since it is a property of the target hardware/model.
 
-# --- Vertical ROI (STAGE 2+ level-2 static fallback only; dynamic path now uses the floor) ---
+# --- Vertical ROI ---
 HOOD_Y_BOTTOM                 = 0.97   # fixed bottom edge — ego hood [norm]
 IMAGE_Y_MIN                   = 0.0    # hard upper floor — gantry expansion limit [norm]
 IMAGE_Y_MAX                   = 1.0    # hard lower floor [norm]
@@ -360,19 +222,16 @@ LANE_HW_CLAMP_MIN            = 0.05   # minimum half-lane-width clamp [norm]
 LANE_HW_CLAMP_MAX            = 0.45   # maximum half-lane-width clamp [norm]
 
 # --- Lane / level thresholds ---
-LANE_CONF_MIN                = 0.5    # STAGE 2: retained only as a reference
-                                        # value inside _estimate_confidence()'s
-                                        # lane-confidence contribution; no
-                                        # longer used as a hard switch anywhere
-                                        # in _compute_base_roi().
+LANE_CONF_MIN                = 0.5    # reference value used inside _estimate_confidence()'s
+                                        # lane-confidence contribution; not used as a hard
+                                        # switch anywhere in _compute_base_roi().
 
 # ==========================================================================
-# STAGE 2 — Unified confidence and degradation-blending constants (NEW)
+# Unified confidence and degradation-blending constants
 # ==========================================================================
 
 # --- Yaw-steering mismatch -> dynamics confidence mapping ---
-# Grounded in the mismatch-magnitude tiers discussed during design
-# (review_note.md Section 4.1 / the slip-handling conversation):
+# Mismatch-magnitude tiers:
 #   <2 deg/s   : normal, full confidence
 #   2-5 deg/s  : mild instability
 #   5-15 deg/s : significant slip
@@ -390,27 +249,21 @@ ABS_ACTIVE_CONF_CEILING       = 0.5    # confidence ceiling when ABS is active
 # --- Overall confidence -> region blending ---
 # Below CONF_BLEND_LOW: pure fallback (CAN-only centring, widest corridor)
 # Above CONF_BLEND_HIGH: pure dynamic (full lane-based centring)
-# Between: linear interpolation — this is what replaces the old hard
-# switch at LANE_CONF_MIN, eliminating the single-frame jump documented
-# as a known defect in review_note.md Section 2.4/2.7.
+# Between: linear interpolation
 CONF_BLEND_LOW                = 0.40
 CONF_BLEND_HIGH               = 0.65
 
-# Below this, abandon even the CAN-only fallback and return the full
-# image — Stage 2's new Level 3, addressing the previously-missing
-# "nothing reliable" floor described in review_note.md Section 5.3.
+# Below this, abandon even the CAN-only fallback and return the full frame.
 CONF_LEVEL3_THRESHOLD         = 0.15
 
 # --- Confidence-scaled corridor widening ---
 # expansion = 1 + (MAX_EXPANSION-1)*(1-confidence); at confidence=1.0
 # the corridor is at its base width, at confidence=0.0 it is
-# MAX_EXPANSION times wider. Matches the design derivation in
-# review_note.md Section 4.1 / Section 8.5 of the earlier technical
-# notes (ported here as this project's authoritative design record).
+# MAX_EXPANSION times wider.
 CORRIDOR_MAX_EXPANSION_FACTOR = 3.0
 
 # ==========================================================================
-# STAGE 5 — Curvature source fusion constants (NEW)
+# Curvature source fusion constants
 # ==========================================================================
 
 # --- Vision trust threshold ---
@@ -419,12 +272,10 @@ VISION_CURVATURE_TRUST_THRESHOLD = 0.5   # c2_confidence must be at least
     # Below this, fall back to the CAN bicycle-model curvature — vision
     # is preferred over CAN whenever it is reasonably confident, because
     # it provides genuine look-ahead (the road shape ahead), whereas CAN
-    # only reflects instantaneous curvature at the vehicle's own position
-    # (see review_note.md Section 7.2 for the full reasoning).
+    # only reflects instantaneous curvature at the vehicle's own position.
 
 # --- CAN/vision mismatch -> curvature-agreement confidence tiers ---
-# Grounded the same way as CURVATURE_ERROR_SIGMA_INV_M (Section 6.4/23.2):
-# using ISO 15623's 125m minimum design curve radius as the reference
+# Using ISO 15623's 125m minimum design curve radius as the reference
 # scale (c2 ~= 1/(2*125) = 0.004 /m). Mismatch tiers are expressed as
 # fractions/multiples of that reference value, not arbitrary numbers.
 CURVATURE_MISMATCH_MILD_INV_M        = 0.001   # ~25% of the ISO 15623 reference curvature
@@ -439,12 +290,10 @@ OBJECT_MARGIN                = 0.015  # base padding added around expanded bboxe
 
 # --- Default confidence gates ---
 DEFAULT_CONF_VEHICLE         = 0.0    # confidence threshold is intentionally
-                                       # permissive (FCW-critical) — STAGE 3:
-                                       # the actual gating that prevents
-                                       # over-eager expansion is no longer
-                                       # this threshold, but the separate
-                                       # corridor-membership + confirmed-track
-                                       # + valid-TTC checks in
+                                       # permissive (FCW-critical) — the actual
+                                       # gating that prevents over-eager expansion
+                                       # is the separate corridor-membership +
+                                       # confirmed-track + valid-TTC checks in
                                        # _apply_object_expansions(). See
                                        # _is_in_corridor() and that function's
                                        # docstring.
@@ -452,12 +301,10 @@ DEFAULT_CONF_SIGNAL          = 0.55   # traffic light minimum confidence
 DEFAULT_CONF_SIGN_ROADSIDE   = 0.60   # roadside sign minimum confidence
 DEFAULT_CONF_SIGN_OVERHEAD   = 0.60   # gantry sign minimum confidence
 
-# --- Smoothing: STAGE 4 IMPLEMENTED. Old single-rate IIR (SMOOTHING_ALPHA)
-# and snap-threshold constants (ROI_SNAP_CX_THRESHOLD, ROI_SNAP_W_THRESHOLD)
-# REMOVED 2026-08-06 — replaced by the asymmetric per-edge filter
-# (ASYM_ALPHA_GROW_EDGE, ASYM_ALPHA_SHRINK_EDGE, defined alongside
-# _smooth_asymmetric() further down this file, where the filter itself
-# lives) rather than kept as unused dead constants alongside it.
+# --- Smoothing ---
+# The asymmetric per-edge filter constants (ASYM_ALPHA_GROW_EDGE,
+# ASYM_ALPHA_SHRINK_EDGE) are defined alongside _smooth_asymmetric()
+# further down this file, where the filter itself lives.
 
 # --- Safety clamp bounds ---
 ROI_WIDTH_MIN                = 0.05   # minimum allowed ROI width [norm]
@@ -475,56 +322,36 @@ TTC_WARN_SCALE               = 1.40   # margin multiplier in warning zone
 TTC_CRIT_SCALE               = 2.00   # margin multiplier in critical zone
 TTC_MAX_VALID_S              = 10.0   # TTC values beyond this treated as no-threat [s]
 
-# NOTE: FOCAL_NORM_APPROX and OBJECT_REAL_HEIGHT_M deleted in Stage 1 —
-# confirmed dead code in the prior version. The TTC estimate below uses a
-# normalised-height growth-rate approximation that never referenced them.
 
 # ==========================================================================
 # Kalman tracker constants
 # ==========================================================================
 
 N_INIT                       = 3      # hit_streak required to confirm a track
-MAX_AGE                      = 5      # frames before a lost track is deleted
-    # STAGE 6 INTEGRATION NOTE (2026-08-07): this is FRAMES, not seconds.
-    # If the calling system runs the detector at a reduced rate (per the
-    # Stage 6 detection-scheduling design — see review_note.md) but still
-    # calls ROIGenerator.step() every camera frame, MAX_AGE frames no
-    # longer represents the real-world time window it may have been
-    # tuned against. Example: at 30fps with the detector running every
-    # frame, MAX_AGE=5 means ~167ms before a track is dropped. If the
-    # detector is instead scheduled at half-rate (every 2nd camera
-    # frame), the SAME MAX_AGE=5 raw-frame-count either represents
-    # ~333ms of real time (if step() is still called every camera
-    # frame and skipped-detector frames pass empty detection lists) or
-    # a different value again depending on exactly how the calling
-    # system wires the schedule. This constant should be RE-TUNED in
-    # terms of real elapsed time once the actual detector schedule is
-    # fixed by real hardware timing (see Section 3.3's "Pending
-    # Confirmation" on hardware timing) — it is not automatically
-    # correct just because the underlying predict/re-associate
-    # mechanism has been confirmed to work across gaps (verified
-    # 2026-08-07, see test_vectors.py Category 11).
+MAX_AGE                      = 5      # frames before a lost track is deleted.
+    # NOTE: this is FRAMES, not seconds. If the calling system runs the
+    # detector at a reduced rate but still calls ROIGenerator.step()
+    # every camera frame, MAX_AGE frames no longer represents the same
+    # real-world time window it was tuned for. This constant should be
+    # re-tuned in terms of real elapsed time once the actual detector
+    # schedule is fixed by hardware timing.
 
 # ==========================================================================
-# STAGE 8B — Cold/hot start: warm-up threshold (NEW, added 2026-08-11)
+# Warm-up threshold
 # ==========================================================================
 
 WARMUP_FRAMES_REQUIRED = 10   # frames a ROIGenerator instance must have
     # processed before it reports is_warmed_up=True on its output.
     # PENDING CONFIRMATION — an engineering estimate, not a precisely
-    # derived figure. Reasoning: set to more than 3x N_INIT (the
-    # confirmed-track threshold, =3), giving margin for at least one
-    # full track-confirmation cycle plus some settling time for the
-    # asymmetric smoothing filter (which separately converges to >95%
-    # of target within roughly 3 frames on a step change — see the
-    # Stage 4 fast-grow verification) and for camera-based curvature
-    # to become available, if it is going to be. At 30fps this is
-    # ~333ms — the same order of magnitude as the MAX_AGE=5 track
-    # lifecycle window above, deliberately, since both concern how
+    # derived figure. Set to more than 3x N_INIT (the confirmed-track
+    # threshold, =3), giving margin for at least one full
+    # track-confirmation cycle plus settling time for the asymmetric
+    # smoothing filter and for camera-based curvature to become
+    # available. At 30fps this is ~333ms — the same order of magnitude
+    # as the MAX_AGE=5 track lifecycle window above, since both concern
+    # how
     # long this module needs to trust its own freshly-started state.
-    # Like MAX_AGE, this is a FRAME count, not a time — see that
-    # constant's note on why frame counts and real time can diverge
-    # under detection scheduling.
+    # Like MAX_AGE, this is a FRAME count, not a time.
 
 # Kalman process noise (state = [cx, cy, w, h, vx, vy])
 KF_Q_POS                     = 1e-2   # position process noise variance
@@ -572,16 +399,12 @@ class CanSignals:
     yaw_rate_dps:       Optional[float]
     steering_valid:     bool
     yaw_rate_valid:     bool
-    esc_active:         bool = False   # STAGE 2 (NEW): Electronic Stability
-                                        # Control intervening — strong slip
-                                        # indicator, used by _estimate_confidence()
-    abs_active:         bool = False   # STAGE 2 (NEW): Anti-lock Braking active
-                                        # — used both by _estimate_confidence()
-                                        # and by the Stage 1 vertical-margin
-                                        # fallback in _invariant_floor(), which
-                                        # previously required this to be passed
-                                        # in separately rather than read from
-                                        # CanSignals directly.
+    esc_active:         bool = False   # Electronic Stability Control intervening —
+                                        # strong slip indicator, used by
+                                        # _estimate_confidence()
+    abs_active:         bool = False   # Anti-lock Braking active — used by both
+                                        # _estimate_confidence() and the vertical-
+                                        # margin fallback in _invariant_floor()
 
 
 @dataclass
@@ -589,25 +412,21 @@ class LaneInfo:
     center_norm:  Optional[float]
     width_norm:   Optional[float]
     confidence:   float
-    c2_curvature:  Optional[float] = None  # STAGE 5 (NEW): vision-estimated
-        # road curvature (1/m), from the PREVIOUS frame's lane detection
-        # output — see review_note.md Section 7 for why previous-frame
-        # vision output (not current-frame) avoids a circular dependency
-        # between the region and the model that runs inside it.
-    c2_confidence: float = 0.0             # STAGE 5 (NEW): confidence in
-        # c2_curvature specifically, separate from the overall lane
-        # position confidence above — a lane detector can be confident
-        # about WHERE the lane centre is nearby while being much less
-        # certain about the FAR-FIELD CURVATURE shape, and vice versa.
+    c2_curvature:  Optional[float] = None  # vision-estimated road curvature (1/m),
+        # from the PREVIOUS frame's lane detection output — previous-frame
+        # vision avoids a circular dependency between the region and the
+        # model that runs inside it.
+    c2_confidence: float = 0.0             # confidence in c2_curvature specifically,
+        # separate from the overall lane position confidence above — a lane
+        # detector can be confident about WHERE the lane centre is nearby
+        # while being much less certain about the far-field curvature shape,
+        # and vice versa.
 
 
 @dataclass
 class CameraIntrinsics:
     """
-    STAGE 1 (NEW): camera geometry required for all physics-based
-    ROI calculations. Nothing in this module could compute a real-world
-    projection without these values — they were entirely absent before
-    Stage 1.
+    Camera geometry required for all physics-based ROI calculations.
 
     focal_px       : focal length in pixels (horizontal and vertical
                       assumed equal — a common simplification for
@@ -617,16 +436,15 @@ class CameraIntrinsics:
     principal_y_px : principal point (usually close to image centre).
     image_width_px,
     image_height_px: sensor / frame resolution actually used for the
-                      curvature and floor projection (this should match
-                      whatever resolution CanSignals-derived geometry
-                      assumes — typically the full, undistorted frame
-                      resolution after lens distortion correction).
+                      curvature and floor projection (should match the
+                      full, undistorted frame resolution after lens
+                      distortion correction).
     mount_height_m : camera height above the road surface.
     pitch_rad      : camera pitch angle, positive = tilted downward
                       (nose-down). Defaults to 0.0 (level camera).
-                      STAGE 1 does not estimate this precisely — see
-                      ABS_ACTIVE_VERTICAL_MARGIN_M for the interim
-                      conservative-widening fallback used instead.
+                      See ABS_ACTIVE_VERTICAL_MARGIN_M for the
+                      conservative-widening fallback used when pitch
+                      is not estimated precisely.
     """
     focal_px:        float
     principal_x_px:  float
@@ -658,52 +476,32 @@ class ROIParameters:
     width:     float
     height:    float
     roi_level: int = 0
-    frames_since_init: int = 0   # STAGE 8B (NEW, 2026-08-11): how many
-        # step() calls this generator instance has processed, including
-        # this one. Default 0 preserves prior behaviour for any
-        # ROIParameters constructed WITHOUT going through
-        # ROIGenerator.step() — internal intermediate values throughout
-        # this module, and the stateless generate_dynamic_roi() API,
-        # which has no persistent frame count to report and does not
-        # touch this field at all (warm-up tracking is inherently a
-        # STATEFUL concept). Only the FINAL output of ROIGenerator.step()
-        # has this field stamped with a real, meaningful value.
-    is_warmed_up: bool = True    # STAGE 8B (NEW, 2026-08-11): whether
-        # enough frames have passed for the system's own internal state
-        # (confirmed tracks, settled smoothing, any available vision
-        # curvature) to be considered established, as opposed to a
-        # value produced during the first handful of frames after
-        # start-up. Default True is the SAFE choice for anything that
-        # does not explicitly set it: internal intermediate values and
-        # the stateless API were never subject to a warm-up concept
-        # before this field existed, so leaving them at the permissive
-        # default changes nothing for existing behaviour. Only
-        # ROIGenerator.step()'s actual final output computes this
-        # honestly, from a real frame count — see WARMUP_FRAMES_REQUIRED.
+    frames_since_init: int = 0   # how many step() calls this generator instance has
+        # processed, including this one. Default 0 for ROIParameters constructed
+        # outside ROIGenerator.step() — warm-up tracking is inherently stateful.
+        # Only the final output of ROIGenerator.step() has a real, meaningful value.
+    is_warmed_up: bool = True    # whether enough frames have passed for the system's
+        # internal state (confirmed tracks, settled smoothing, available vision
+        # curvature) to be considered established. Default True is the safe choice
+        # for internal intermediate values and the stateless API. Only
+        # ROIGenerator.step()'s actual final output computes this honestly from a
+        # real frame count — see WARMUP_FRAMES_REQUIRED.
         #
-        # IMPORTANT: this says nothing about CURRENT confidence — a
-        # well-warmed-up system can still report roi_level==3 (Level 3,
-        # nothing currently trustworthy) if conditions genuinely
-        # deteriorate later in a drive. is_warmed_up and roi_level
-        # answer two different questions and are meant to be read
-        # together, not as substitutes for each other: "has enough time
-        # passed for my internal state to be established" versus "is my
-        # current confidence high right now."
-    speed_was_implausible: bool = False  # STAGE 8B (NEW, 2026-08-11):
-        # True if the reported speed read approximately zero AND was
-        # judged physically implausible (see _is_speed_plausible) —
-        # e.g. a brief restart while the vehicle is genuinely still
-        # moving, with CAN not yet delivering valid data. When True,
-        # DEFAULT_ASSUMED_SPEED_MPS_ON_IMPLAUSIBLE_ZERO was substituted
-        # for every calculation this frame, INCLUDING the one that
-        # produced this very ROIParameters. Default False preserves
-        # prior behaviour for anything not explicitly set by
-        # _compute_base_roi (which stamps this honestly on every
-        # ROIParameters it constructs, at all of its return points).
+        # IMPORTANT: this says nothing about CURRENT confidence — a well-warmed-up
+        # system can still report roi_level==3 if conditions genuinely deteriorate.
+        # is_warmed_up and roi_level answer two different questions: "has enough
+        # time passed for internal state to be established" versus "is current
+        # confidence high right now."
+    speed_was_implausible: bool = False  # True if the reported speed read
+        # approximately zero AND was judged physically implausible (see
+        # _is_speed_plausible). When True,
+        # DEFAULT_ASSUMED_SPEED_MPS_ON_IMPLAUSIBLE_ZERO was substituted for every
+        # calculation this frame. Default False for anything not explicitly set by
+        # _compute_base_roi.
 
 
 # ==========================================================================
-# STAGE 1 — Invariant collision-coverage floor
+# Invariant collision-coverage floor
 # ==========================================================================
 
 def _z_max(speed_mps: float,
@@ -724,16 +522,16 @@ def _z_max(speed_mps: float,
 
 
 # ==========================================================================
-# STAGE 7 — ISA sign readability horizon (NEW)
+# ISA sign readability horizon
 # ==========================================================================
 
 def isa_sign_diameter_for_design_speed_kmh(design_speed_kmh: float) -> float:
     """
-    STAGE 7 (NEW): looks up the IRC 67 regulatory sign diameter for a
-    given road design speed. A convenience function — callers may also
-    supply a sign diameter directly to _isa_readability_check() without
-    going through this lookup, e.g. if the actual road class is known
-    from a source other than a raw speed value.
+    Looks up the IRC 67 regulatory sign diameter for a given road design
+    speed. Callers may also supply a sign diameter directly to
+    _isa_readability_check() without going through this lookup, e.g. if
+    the actual road class is known from a source other than a raw speed
+    value.
     """
     if design_speed_kmh <= 65.0:
         return IRC67_SIGN_DIAMETER_LE_65_M
@@ -751,10 +549,10 @@ def _isa_required_decision_time_s(speed_mps: float, target_speed_mps: float,
                                    reaction_time_s: float = ISA_REACTION_TIME_S,
                                    decel_mps2: float = ISA_COMFORTABLE_DECEL_MPS2) -> float:
     """
-    STAGE 7 (NEW): total time the driver needs between seeing a speed
-    limit sign and having comfortably adjusted to it — perception/
-    reaction time plus the time to gently decelerate to the new limit
-    (zero if the new limit is not lower than current speed).
+    Total time the driver needs between seeing a speed limit sign and
+    having comfortably adjusted to it — perception/reaction time plus
+    the time to gently decelerate to the new limit (zero if the new
+    limit is not lower than current speed).
     """
     speed_reduction = max(0.0, speed_mps - target_speed_mps)
     return reaction_time_s + speed_reduction / decel_mps2
@@ -764,10 +562,10 @@ def _isa_min_detection_distance_m(speed_mps: float, target_speed_mps: float,
                                    reaction_time_s: float = ISA_REACTION_TIME_S,
                                    decel_mps2: float = ISA_COMFORTABLE_DECEL_MPS2) -> float:
     """
-    STAGE 7 (NEW): the minimum distance at which a sign must be
-    detected AND read for the driver to have the full decision-time
-    budget available. Working backward from
-    _isa_required_decision_time_s: distance = speed * time_required.
+    The minimum distance at which a sign must be detected AND read for
+    the driver to have the full decision-time budget available. Working
+    backward from _isa_required_decision_time_s:
+    distance = speed * time_required.
     """
     t_required = _isa_required_decision_time_s(speed_mps, target_speed_mps, reaction_time_s, decel_mps2)
     return speed_mps * t_required
@@ -777,20 +575,17 @@ def _isa_readability_check(speed_mps: float, target_speed_mps: float,
                             sign_diameter_m: float, camera: CameraIntrinsics,
                             min_sign_px: float = ISA_MIN_SIGN_PX) -> Tuple[bool, float, float]:
     """
-    STAGE 7 (NEW): the combined ISA readability check. Answers: "if
-    this sign is detected right at the minimum distance the driver
-    needs for adequate decision time, will it actually have enough
-    pixels to be classified?"
+    The combined ISA readability check. Answers: "if this sign is detected
+    right at the minimum distance the driver needs for adequate decision
+    time, will it actually have enough pixels to be classified?"
 
     Returns (is_adequately_readable, required_distance_m, pixel_size_at_that_distance).
 
-    A False result is an important, honest finding in its own right —
-    it means the physical decision-time requirement and the camera's
-    resolving power are in tension at this speed, exactly the situation
-    identified during this project's IRC 67 analysis (a sign at the IRC
-    67 advance-placement distance can be below reliable classification
-    threshold at native camera resolution — the core argument for why
-    the adaptive high-resolution crop matters for ISA specifically).
+    A False result means the physical decision-time requirement and the
+    camera's resolving power are in tension at this speed — a sign at the
+    IRC 67 advance-placement distance can be below reliable classification
+    threshold at native camera resolution, which is the core argument for
+    why an adaptive high-resolution crop matters for ISA specifically.
     """
     required_distance = _isa_min_detection_distance_m(speed_mps, target_speed_mps)
     if required_distance <= 1e-6:
@@ -811,8 +606,8 @@ def _corridor_half_width_m(z_m: float,
     Half-width of the safety corridor at a given forward distance z_m.
 
     w(Z) = lane_width + 2*wander_sigma + 2*Z^2*curvature_sigma
-    Half-width returned is w(Z) / 2, then scaled by a STAGE 2 (NEW)
-    confidence-driven expansion factor:
+    Half-width returned is w(Z) / 2, then scaled by a confidence-driven
+    expansion factor:
 
         expansion = 1 + (CORRIDOR_MAX_EXPANSION_FACTOR - 1) * (1 - confidence)
 
@@ -831,8 +626,7 @@ def _corridor_half_width_m(z_m: float,
 
     NOTE: wander_sigma_m and curvature_sigma_inv_m are PENDING
     CONFIRMATION placeholders (see constants block). Replace with
-    measured values once the curvature fusion module (Stage 5) has
-    validation data.
+    measured values once validation data is available.
     """
     confidence = _clamp(confidence)
     full_width = lane_width_m + 2.0 * wander_sigma_m + 2.0 * (z_m ** 2) * curvature_sigma_inv_m
@@ -848,15 +642,12 @@ def _lane_lateral_position_m(z_m: float, c0_m: float, c1_rad: float, c2_inv_m: f
 
     SIGN CONVENTION NOTE: c2_inv_m is expected to already be negated
     relative to the raw _compute_curvature() output, to match the sign
-    convention used by the pre-existing _lateral_offset_norm() function
-    elsewhere in this module (which applies
+    convention used by _lateral_offset_norm() (which applies
     math.copysign(magnitude, -curvature) — i.e. positive raw curvature
     shifts the lane-based region toward negative image-x). Callers of
     this function (see _invariant_floor) must pass -curvature, not
     curvature, to keep the floor and the lane-based region agreeing on
-    which direction the corridor sweeps for a given curvature sign. This
-    was found and fixed during Stage 1 verification testing — the two
-    subsystems disagreed on sign before this fix.
+    which direction the corridor sweeps for a given curvature sign.
 
     c0_m   : lateral offset of the lane centre at the vehicle (m)
     c1_rad : heading angle of the lane relative to vehicle heading (rad,
@@ -878,8 +669,8 @@ def _project_vertical_to_pixel(height_m: float, z_m: float, camera: CameraIntrin
     """
     Pinhole projection of a point at world height `height_m` above the
     road, at forward distance z_m, to a vertical pixel row. Includes the
-    camera pitch correction term (Stage 1: pitch defaults to 0.0 unless
-    explicitly supplied on the CameraIntrinsics instance).
+    camera pitch correction term (pitch defaults to 0.0 unless explicitly
+    supplied on the CameraIntrinsics instance).
 
     Convention: image v increases DOWNWARD (row 0 = top of image,
     consistent with the rest of this module's normalised [0,1] top-left
@@ -891,12 +682,10 @@ def _project_vertical_to_pixel(height_m: float, z_m: float, camera: CameraIntrin
     v(Z, H) = cy + f * ( (H_cam - H) / Z - pitch_rad )
 
     NOTE ON PITCH SIGN: the sign of the pitch_rad term above has NOT
-    been verified against a real recorded hard-braking or uphill/
-    downhill sequence — it is a reasoned first-principles derivation
-    (camera axis rotating toward the ground reduces the apparent
-    downward angle to a ground point), not an empirically confirmed
-    convention. Treat as PENDING CONFIRMATION. This is precisely why
-    the ABS-active fallback below is implemented symmetrically
+    been verified against a real recorded hard-braking or uphill/downhill
+    sequence — it is a reasoned first-principles derivation, not an
+    empirically confirmed convention. Treat as PENDING CONFIRMATION. This
+    is precisely why the ABS-active fallback is implemented symmetrically
     (widening both edges) rather than assuming a specific direction —
     see _invariant_floor.
     """
@@ -910,33 +699,22 @@ def _project_vertical_to_pixel(height_m: float, z_m: float, camera: CameraIntrin
 @dataclass
 class FloorClampDiagnostics:
     """
-    STAGE 8B (NEW, added 2026-08-11): optional diagnostic record,
-    populated by _invariant_floor() when a diagnostics object is
-    passed in. Records whether the floor's RAW (pre-clamp)
-    mathematical extent would have gone beyond the actual image on
-    each of the four sides, before the existing safety clamp forces it
+    Optional diagnostic record, populated by _invariant_floor() when a
+    diagnostics object is passed in. Records whether the floor's RAW
+    (pre-clamp) mathematical extent would have gone beyond the actual
+    image on each of the four sides, before the safety clamp forces it
     back within [0, 1].
 
-    Found as a gap during the 2026-08-10 code review: the clamp itself
-    already existed and already worked correctly (the floor can never
-    report a position outside the real image) — but nothing recorded
-    WHEN this happened. Without that record, there was no way to find
+    Without this record there is no way to find
     out, after the fact, whether a sharp curve at a given speed had
     pushed the required corridor past what the camera's field of view
-    can physically show — a case where the floor's true, safety-
-    required extent and what the camera can actually deliver have
-    diverged, which is exactly the kind of condition a review would
-    want visibility into.
+    can physically show — a case where the floor's true, safety-required
+    extent and what the camera can actually deliver have diverged.
 
-    This is deliberately a plain, inspectable record rather than a
-    printed warning fired every frame it occurs — on a sustained sharp
-    curve this condition could legitimately persist for many
-    consecutive frames, and a warning on every one of those frames
-    would be operational noise, not a useful signal. Whether and how
-    to log, count, or alert on this is left to the calling system,
-    which is better placed to decide what counts as noteworthy for its
-    own purposes (e.g. counting the fraction of frames affected over a
-    drive, rather than each individual frame).
+    This is a plain, inspectable record rather than a warning fired every
+    frame — on a sustained sharp curve this condition could legitimately
+    persist for many consecutive frames. Whether and how to log, count,
+    or alert on this is left to the calling system.
     """
     clamped_left:   bool = False
     clamped_right:  bool = False
@@ -965,13 +743,11 @@ def _invariant_floor(
     diagnostics: Optional[FloorClampDiagnostics] = None,
 ) -> Tuple[float, float, float, float]:
     """
-    STAGE 1 core function, extended in STAGE 2 with a `confidence`
-    parameter (default 1.0 preserves exact Stage 1 behaviour), and in
-    STAGE 8B with an optional `diagnostics` parameter (default None
-    preserves exact prior behaviour for every existing caller).
-    Computes the physics-based minimum ROI — the invariant
-    collision-coverage floor — from ego speed, road curvature, and
-    camera geometry alone. No object detections are required or used.
+    Computes the physics-based minimum ROI — the invariant collision-coverage
+    floor — from ego speed, road curvature, and camera geometry alone.
+    No object detections are required or used. The optional `diagnostics`
+    parameter (default None) populates a FloorClampDiagnostics record when
+    provided.
 
     Returns (x_left_norm, x_right_norm, y_top_norm, y_bottom_norm),
     all normalised to [0, 1] and already clamped to valid image bounds.
@@ -983,30 +759,22 @@ def _invariant_floor(
     --- Lateral bound ---
     The corridor edges are x_lane(Z) ± half_width(Z), projected to
     pixels. Because both the curvature term (c2*Z) and the corridor
-    half-width itself (Stage 1: ~Z^2) vary with Z, the true extremum
-    is evaluated by sampling Z_near, Z_max, and an interior critical
-    point derived from the DOMINANT curvature term (holding width's own
-    Z-dependence fixed at its value at that candidate point). This is a
-    deliberate, documented engineering approximation — see review_note.md
-    Section 4.5 — rather than a full closed-form solution of the
-    combined quartic, which was judged unnecessary complexity for the
-    accuracy this floor requires. All three candidate points are
-    evaluated and the true min/max taken, so the approximation can only
-    ever make the floor slightly more conservative (wider), never
-    unsafe.
+    half-width itself (~Z^2) vary with Z, the true extremum is evaluated
+    by sampling Z_near, Z_max, and an interior critical point derived from
+    the dominant curvature term. This is a deliberate engineering
+    approximation rather than a full closed-form solution of the combined
+    quartic — the approximation can only make the floor slightly more
+    conservative (wider), never unsafe.
 
-    STAGE 2 (NEW): `confidence` (0.0-1.0) scales the corridor half-width
-    via _corridor_half_width_m's expansion factor — lower confidence
-    (from CAN/lane disagreement, ESC/ABS activity, or low lane
-    detection confidence; see _estimate_confidence) widens the corridor
-    up to CORRIDOR_MAX_EXPANSION_FACTOR times its base width.
+    `confidence` (0.0-1.0) scales the corridor half-width via
+    _corridor_half_width_m's expansion factor — lower confidence widens
+    the corridor up to CORRIDOR_MAX_EXPANSION_FACTOR times its base width.
 
     --- Vertical bound ---
     Upper bound: road surface (H=0) at Z_max.
     If isa_enabled: also checks the gantry height at its minimum read
     distance, and the floor extends further up if that requirement is
-    more demanding (this is the direct, quantifiable "ISA cost" to the
-    shared ROI — see review_note.md Section 6.4 discussion).
+    more demanding.
     Lower bound: road surface at Z_near.
     If abs_active: adds a fixed conservative vertical margin in place
     of precise pitch estimation (see ABS_ACTIVE_VERTICAL_MARGIN_M).
@@ -1015,10 +783,9 @@ def _invariant_floor(
     z_near = z_near_m
 
     # --- Lateral bound: sample near, far, and one interior critical point ---
-    # Sign convention: negate curvature_inv_m here to match the existing
+    # Sign convention: negate curvature_inv_m here to match the
     # _lateral_offset_norm() convention used by the lane-based region
-    # elsewhere in this module (see _lane_lateral_position_m docstring).
-    # Found and fixed during Stage 1 verification testing.
+    # (see _lane_lateral_position_m docstring).
     c2_signed = -curvature_inv_m
     candidate_zs = [z_near, z_far]
 
@@ -1063,14 +830,12 @@ def _invariant_floor(
     v_bottom_px = _project_vertical_to_pixel(0.0, z_near, camera)  # near-field bound, at Z_near
 
     if abs_active:
-        # STAGE 1 fallback for unmodelled pitch during hard braking.
+        # Fallback for unmodelled pitch during hard braking.
         # The true direction of the pitch-induced shift is PENDING
         # CONFIRMATION (see _project_vertical_to_pixel docstring), so
-        # this margin is applied SYMMETRICALLY — widening both the
-        # upper and lower bound — rather than guessing a direction and
-        # potentially widening the wrong way. This is deliberately more
-        # conservative (costs a little extra frame area) in exchange
-        # for not depending on an unverified sign convention.
+        # this margin is applied SYMMETRICALLY — widening both the upper
+        # and lower bound — rather than guessing a direction and
+        # potentially widening the wrong way.
         pitch_margin_px = camera.focal_px * ABS_ACTIVE_VERTICAL_MARGIN_M / max(z_near, 1.0)
         v_top_px -= pitch_margin_px     # extend further toward/past the horizon
         v_bottom_px += pitch_margin_px  # extend further toward/past the hood line
@@ -1087,12 +852,11 @@ def _invariant_floor(
     y_bottom_norm = _clamp(y_bottom_raw)
 
     if diagnostics is not None:
-        # STAGE 8B (NEW): record whether the camera's field of view
-        # was the limiting factor on each side this frame — i.e.
-        # whether the RAW (pre-clamp) value actually fell outside
-        # [0, 1], meaning the true, physics-required extent of the
-        # floor could not be fully delivered by the sensor's field of
-        # view at the current speed/curvature combination.
+        # Record whether the camera's field of view was the limiting
+        # factor on each side — i.e. whether the RAW (pre-clamp) value
+        # actually fell outside [0, 1], meaning the true, physics-
+        # required extent of the floor could not be fully delivered by
+        # the sensor's field of view at the current speed/curvature.
         diagnostics.clamped_left   = x_left_raw   < 0.0
         diagnostics.clamped_right  = x_right_raw  > 1.0
         diagnostics.clamped_top    = y_top_raw    < 0.0
@@ -1106,21 +870,18 @@ def _invariant_floor(
 
 
 # ==========================================================================
-# STAGE 8B — Input quantization (NEW, added 2026-08-11)
+# Input quantization
 # ==========================================================================
 #
-# Per the manager's suggestion (review_note.md Section 19) and the
-# follow-up decision recorded in Section 20: group speed, curvature,
-# and confidence into a small, fixed set of bands BEFORE running the
-# existing floor calculation, rather than storing a precomputed table.
-# This makes the input domain finite (so it can be checked exhaustively
-# rather than trusted by analytical argument alone) and guarantees the
-# result cannot change unless the vehicle has genuinely moved into a
-# different band — WITHOUT the two-sources-of-truth risk or the
-# per-vehicle regeneration burden a stored table would carry.
+# Speed, curvature, and confidence are grouped into a small, fixed set of
+# bands BEFORE running the floor calculation, rather than storing a
+# precomputed table. This makes the input domain finite (so it can be
+# checked exhaustively rather than trusted by analytical argument alone)
+# and guarantees the result cannot change unless the vehicle has genuinely
+# moved into a different band.
 #
-# IMPORTANT SAFETY FINDING (2026-08-11, during implementation): a naive
-# "round curvature magnitude up to the next band edge" approach was
+# IMPORTANT SAFETY FINDING: a naive "round curvature magnitude up to the
+# next band edge" approach was
 # tested directly and found to be UNSAFE for one of the two lateral
 # edges. As curvature magnitude grows, the corridor's NEAR edge
 # (towards the inside of the turn) correctly saturates toward the image
@@ -1128,68 +889,57 @@ def _invariant_floor(
 # correctly SHRINKS, because a sharper curve genuinely does not extend
 # as far to the outside as a gentler one does. Rounding curvature up
 # would therefore shrink the far edge below what the true, gentler
-# curvature actually requires — an under-coverage, in the exact
-# direction this module exists to prevent. Confirmed directly: at
-# 80 km/h, x_right shrinks from 0.7151 (kappa=0) to 0.1943
-# (kappa=0.20), a clear, non-monotonic, safety-relevant reversal.
+# curvature actually requires — an under-coverage in the exact direction
+# this module exists to prevent. At 80 km/h, x_right shrinks from 0.7151
+# (kappa=0) to 0.1943 (kappa=0.20), a clear, non-monotonic,
+# safety-relevant reversal.
 #
 # The fix: curvature is NOT bucketed by rounding to one edge. Instead,
 # the floor is evaluated at several sample points spanning the width of
-# the curvature band, and the ENVELOPE (widest edges) across all of
-# them is used — this is safe by construction, regardless of which
-# direction the true relationship moves, since it takes the outer
-# bound of whatever was actually sampled rather than assuming a
-# monotonic trend. Speed and confidence, by contrast, were verified
-# directly to be cleanly monotonic across their full ranges (see the
-# same 2026-08-11 verification), so a single representative edge is
-# sufficient and safe for those two dimensions.
+# the curvature band, and the ENVELOPE (widest edges) across all of them
+# is used — this is safe by construction, regardless of which direction
+# the true relationship moves. Speed and confidence were verified to be
+# cleanly monotonic, so a single representative edge is sufficient and
+# safe for those two dimensions.
 
 SPEED_BUCKET_UPPER_EDGES_KMH = [26.5, 40.0, 60.0, 80.0, 100.0, 120.0, 150.0]
     # Below 26.5 km/h: Z_MIN_FLOOR_DEPTH_M's minimum-depth clamp already
-    # makes every speed in this range produce an IDENTICAL floor — this
-    # first band is not an approximation at all, just recognising an
-    # exact equivalence that already existed. Each subsequent band uses
-    # its UPPER edge as the effective speed (the fastest, most
-    # demanding case within that band) — matching the manager's own
-    # proposed structure, verified in Section 20 to cost only
-    # 2.8%-13.5% extra margin, shrinking as speed increases. A raw
-    # speed ABOVE the last edge (150 km/h) is NOT bucketed at all — the
-    # true speed is used directly, since bucketing an unexpectedly
-    # extreme value into a possibly-wrong band is a worse risk than
-    # simply computing it fresh.
+    # makes every speed in this range produce an identical floor — this
+    # first band is not an approximation, just recognising an exact
+    # equivalence. Each subsequent band uses its UPPER edge as the
+    # effective speed (the most demanding case within that band), costing
+    # only 2.8%-13.5% extra margin, shrinking as speed increases. A raw
+    # speed ABOVE the last edge (150 km/h) is NOT bucketed — the true
+    # speed is used directly, since bucketing an unexpectedly extreme
+    # value into a possibly-wrong band is a worse risk than computing
+    # it fresh.
 
 CONFIDENCE_BUCKET_EDGES = [0.0, 0.25, 0.50, 0.75, 1.0]
-    # 4 coarse bands. Verified directly (2026-08-11) to be cleanly
-    # monotonic: lower confidence never produces a narrower corridor
-    # across the full range tested. Each value maps to the LOWER edge
-    # of its band — the more cautious (wider-corridor) value within
-    # that band — consistent with "when uncertain, widen" used
-    # throughout this module.
+    # 4 coarse bands. Verified to be cleanly monotonic: lower confidence
+    # never produces a narrower corridor across the full range. Each value
+    # maps to the LOWER edge of its band — the more cautious (wider)
+    # value — consistent with "when uncertain, widen" throughout this module.
 
 CURVATURE_BUCKET_EDGES_INV_M = [0.0, 0.01, 0.02, 0.04, 0.08, 0.12, 0.16, 0.20]
-    # Deliberately finer near zero, where Section 20's own analysis
-    # found the greatest sensitivity to curvature error. Unlike the
-    # other two dimensions, curvature is NOT reduced to a single edge
-    # value — see the envelope approach below and the safety finding
-    # documented above.
+    # Deliberately finer near zero, where sensitivity to curvature error
+    # is greatest. Unlike the other two dimensions, curvature is NOT
+    # reduced to a single edge value — see the envelope approach below
+    # and the safety finding documented above.
 CURVATURE_ENVELOPE_SAMPLES = 5
-    # Number of evenly-spaced sample points evaluated across a
-    # curvature band's magnitude range when building its envelope.
-    # PENDING CONFIRMATION as a specific number — chosen to give the
-    # exhaustive verification (test_vectors.py, oracle.py) a reasonable
-    # chance of catching a local non-monotonic wiggle INSIDE a band,
-    # not just the global trend reversal already found across bands.
-    # Increasing this number only ever makes the envelope MORE
-    # conservative (wider or equal), never less — see
-    # _floor_envelope_for_curvature_band's docstring.
+    # Number of evenly-spaced sample points evaluated across a curvature
+    # band's magnitude range when building its envelope.
+    # PENDING CONFIRMATION as a specific number — chosen to give
+    # exhaustive verification a reasonable chance of catching a local
+    # non-monotonic wiggle inside a band. Increasing this number only
+    # ever makes the envelope MORE conservative (wider or equal), never
+    # less — see _floor_envelope_for_curvature_band's docstring.
 
 
 def _bucket_speed_mps(speed_mps: float) -> float:
     """
-    STAGE 8B (NEW): maps a raw speed to the upper edge of the band it
-    falls into — verified safe because Z_max(v), and therefore the
-    floor's vertical bound, is monotonically non-decreasing in speed
-    across the full range tested (0 to 500 m/s), with no reversal.
+    Maps a raw speed to the upper edge of the band it falls into. Safe
+    because Z_max(v), and therefore the floor's vertical bound, is
+    monotonically non-decreasing in speed with no reversal.
     """
     speed_kmh = speed_mps * 3.6
     for edge_kmh in SPEED_BUCKET_UPPER_EDGES_KMH:
@@ -1200,10 +950,9 @@ def _bucket_speed_mps(speed_mps: float) -> float:
 
 def _bucket_confidence(confidence: float) -> float:
     """
-    STAGE 8B (NEW): maps a raw confidence value down to the lower edge
-    of its band — verified safe because the corridor-width expansion
-    factor is monotonically non-increasing in confidence (i.e. never
-    narrower at lower confidence) across the full range tested.
+    Maps a raw confidence value down to the lower edge of its band. Safe
+    because the corridor-width expansion factor is monotonically
+    non-increasing in confidence (never narrower at lower confidence).
     """
     confidence = _clamp(confidence)
     edges = CONFIDENCE_BUCKET_EDGES
@@ -1215,11 +964,11 @@ def _bucket_confidence(confidence: float) -> float:
 
 def _curvature_bucket_range(curvature_inv_m: float) -> Tuple[float, float, float]:
     """
-    STAGE 8B (NEW): returns (lower_magnitude, upper_magnitude, sign)
-    for the curvature band the input falls into. The CALLER is
-    responsible for sampling across this range and taking the
-    envelope — see _floor_envelope_for_curvature_band — rather than
-    picking one edge, per the safety finding documented above.
+    Returns (lower_magnitude, upper_magnitude, sign) for the curvature
+    band the input falls into. The CALLER is responsible for sampling
+    across this range and taking the envelope — see
+    _floor_envelope_for_curvature_band — per the safety finding
+    documented above.
     """
     if curvature_inv_m == 0.0:
         return 0.0, 0.0, 1.0
@@ -1244,27 +993,24 @@ def _floor_envelope_for_curvature_band(
     confidence: float = 1.0,
 ) -> Tuple[float, float, float, float]:
     """
-    STAGE 8B (NEW): the safe replacement for naive curvature bucketing.
+    The safe replacement for naive curvature bucketing.
 
-    Rather than evaluating _invariant_floor once at a single
-    representative curvature value, this evaluates it at
-    CURVATURE_ENVELOPE_SAMPLES points spread evenly across the
-    magnitude range of the curvature band the true value falls into
-    (preserving sign), and takes the ENVELOPE — the widest x_left, the
-    widest x_right, the highest y_top, and the lowest y_bottom — across
-    all of them.
+    Rather than evaluating _invariant_floor once at a single representative
+    curvature value, this evaluates it at CURVATURE_ENVELOPE_SAMPLES points
+    spread evenly across the magnitude range of the curvature band the true
+    value falls into (preserving sign), and takes the ENVELOPE — the widest
+    x_left, the widest x_right, the highest y_top, and the lowest y_bottom
+    — across all of them.
 
-    This is safe by construction regardless of which direction any
-    individual edge moves as curvature changes: taking the outer bound
-    of several actual evaluations can only ever produce an equal-or-
-    wider region than any single one of those evaluations, including
-    whatever the true, unbucketed curvature would have produced (as
-    long as the true value falls within the sampled band, which it
-    does by construction — see _curvature_bucket_range).
+    This is safe by construction regardless of which direction any individual
+    edge moves as curvature changes: taking the outer bound of several actual
+    evaluations can only ever produce an equal-or-wider region than any single
+    one of those evaluations (as long as the true value falls within the
+    sampled band, which it does by construction — see _curvature_bucket_range).
 
-    Speed and confidence are NOT re-sampled here — they are bucketed
-    once, safely, via the simple edge-rounding functions above, since
-    both were verified to be cleanly monotonic.
+    Speed and confidence are NOT re-sampled here — they are bucketed once,
+    safely, via the simple edge-rounding functions above, since both were
+    verified to be cleanly monotonic.
     """
     bucketed_speed = _bucket_speed_mps(speed_mps)
     bucketed_confidence = _bucket_confidence(confidence)
@@ -1345,32 +1091,14 @@ class KalmanTrack:
     # ------------------------------------------------------------------
     def predict(self) -> None:
         """
-        CRITICAL FIX (found 2026-08-06, during Stage 3 verification):
-        the previous version of this method only updated the DIAGONAL
-        of the covariance matrix P, adding P[4][4] into P[0][0] as a
-        variance contribution but never creating the actual off-diagonal
-        position-velocity cross-covariance term P[0][4] (and P[1][5])
-        that a correct F*P*F^T propagation produces for this motion
-        model. Without that cross-covariance, the Kalman gain for the
-        velocity states (K[4][*], K[5][*]) is always exactly zero,
-        because K = P*H^T*S^-1 and H only measures [cx,cy,w,h] — the
-        gain that lets a POSITION measurement update the VELOCITY
-        estimate depends entirely on that cross-covariance existing.
-
-        The practical consequence, confirmed directly by testing: vx
-        and vy stayed at exactly 0.0 forever, for every track, regardless
-        of how fast or how obviously an object was moving. TTC
-        estimation (_estimate_ttc, which reads vy) has therefore never
-        worked for ANY motion pattern, not just the head-on-approach
-        case this bug was first noticed through — this affects lateral
-        motion (cut-ins, crossing traffic) exactly as much as it
-        affects vertical motion.
-
-        This fix replaces the ad-hoc diagonal-only update with an
-        explicit F*P*F^T + Q computation using the actual constant-
-        velocity transition matrix F (identity, plus F[0][4]=1 and
-        F[1][5]=1 for the cx+=vx, cy+=vy motion model). Cost is
-        negligible (one 6x6 matrix multiply per frame per track).
+        Applies the correct F*P*F^T + Q covariance prediction using the
+        actual constant-velocity transition matrix F. A diagonal-only
+        update is NOT sufficient: without the off-diagonal position-
+        velocity cross-covariance terms P[0][4] and P[1][5], the Kalman
+        gain for velocity states is always zero (since K = P*H^T*S^-1
+        and H only measures [cx,cy,w,h]), making vx and vy permanently
+        zero regardless of observed motion and breaking TTC estimation.
+        Cost is negligible — one 6x6 matrix multiply per frame per track.
         """
         x = self.x
         F = [
@@ -1393,9 +1121,7 @@ class KalmanTrack:
         q_diag = [KF_Q_POS, KF_Q_POS, KF_Q_SIZE, KF_Q_SIZE, KF_Q_VEL, KF_Q_VEL]
         new_P = [[FPFT[i][j] + (q_diag[i] if i == j else 0.0) for j in range(6)] for i in range(6)]
 
-        # Cap velocity variance to prevent unbounded growth on long tracks
-        # (unchanged behaviour from the previous version, just applied
-        # after the now-correct propagation).
+        # Cap velocity variance to prevent unbounded growth on long tracks.
         new_P[4][4] = min(new_P[4][4], 10.0)
         new_P[5][5] = min(new_P[5][5], 10.0)
 
@@ -1466,11 +1192,8 @@ class TrackRegistry:
 
     For production, replace greedy IoU with Hungarian assignment.
 
-    STAGE 6 note: this class already supports being called with an
-    empty detection list on frames where the detector is skipped for
-    compute-budget reasons — predict() runs unconditionally every call.
-    No structural change needed here for the reduced-rate detection
-    scheduling planned in Stage 6; only the calling convention changes.
+    Supports being called with an empty detection list on frames where
+    the detector is skipped — predict() runs unconditionally every call.
     """
 
     def __init__(self, iou_threshold: float = 0.30):
@@ -1570,17 +1293,13 @@ class TrackRegistry:
         """
         BiTrack / SORT compatible path: the bbox RETURNED downstream is
         always the raw external bbox, never overwritten by internal
-        filtering. CORRECTED 2026-08-06: this docstring previously
-        claimed "we only maintain lifecycle state... here," which
-        implied no Kalman filtering happens in this mode — that was
-        inaccurate. self.tracks[tid].update(det.bbox) below DOES run
-        the full internal Kalman update, feeding it the external bbox
-        purely so TTC can still be estimated from the resulting
-        internal velocity state, since the external tracker interface
-        has no field for supplying velocity/TTC directly. Only the
-        RETURNED DetectedObject's position bypasses this — it is
-        always `det` (the original, externally-supplied detection),
-        never the internally-filtered bbox.
+        filtering. An internal Kalman update still runs on every frame,
+        feeding it the external bbox purely so TTC can be estimated from
+        the resulting internal velocity state — the external tracker
+        interface has no field for supplying velocity or TTC directly.
+        Only the RETURNED DetectedObject's position bypasses the
+        internal filter — it is always `det` (the original, externally-
+        supplied detection), never the internally-filtered bbox.
         """
         result: List[DetectedObject] = []
         seen_ids = set()
@@ -1637,8 +1356,7 @@ def _estimate_ttc(
 
     NOTE: this function does not use camera focal length or object
     real-world height — it is a simplified normalised-coordinate
-    approximation. FOCAL_NORM_APPROX and OBJECT_REAL_HEIGHT_M from the
-    prior version were unused dead code and have been removed in Stage 1.
+    approximation.
     """
     if trk.state != TrackState.CONFIRMED:
         return None
@@ -1775,9 +1493,8 @@ def _validate_inputs(
 
 
 def _validate_camera_intrinsics(camera: CameraIntrinsics) -> None:
-    """STAGE 1 (NEW): sanity checks on camera geometry before it is used
-    in any projection — a bad intrinsics value would otherwise silently
-    produce a wrong (and potentially unsafe) floor."""
+    """Sanity checks on camera geometry before it is used in any projection —
+    a bad intrinsics value would otherwise silently produce a wrong floor."""
     if camera.focal_px <= 0.0:
         raise ValueError(f"camera.focal_px must be > 0, got {camera.focal_px}")
     if camera.image_width_px <= 0.0 or camera.image_height_px <= 0.0:
@@ -1807,12 +1524,6 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, v))
 
 
-# NOTE: _roi_center() was REMOVED 2026-08-06 — it was used only by the
-# old _smooth_or_snap() (centre-x/width based smoothing), which Stage 4
-# replaced with _smooth_asymmetric() (per-edge based smoothing, which
-# has no need for a centre calculation). Confirmed unused elsewhere
-# before removal, following the same dead-code cleanup practice as the
-# Stage 1 removal of FOCAL_NORM_APPROX/OBJECT_REAL_HEIGHT_M.
 
 
 def _roi_from_center(
@@ -1833,9 +1544,9 @@ def _roi_from_center(
 
 def _roi_from_edges(x_left: float, x_right: float,
                      y_top: float, y_bottom: float, level: int) -> ROIParameters:
-    """STAGE 1 (NEW): build an ROIParameters directly from edge coordinates,
-    used to convert the floor's (x_left, x_right, y_top, y_bottom) output
-    into the module's (x_left, y_top, width, height) representation."""
+    """Build an ROIParameters directly from edge coordinates, used to convert
+    the floor's (x_left, x_right, y_top, y_bottom) output into the module's
+    (x_left, y_top, width, height) representation."""
     x_left  = _clamp(min(x_left, x_right))
     x_right = _clamp(max(x_left, x_right))
     y_top    = _clamp(min(y_top, y_bottom))
@@ -1851,15 +1562,12 @@ def _roi_from_edges(x_left: float, x_right: float,
 
 def _union_roi(a: ROIParameters, b: ROIParameters, level: int) -> ROIParameters:
     """
-    STAGE 1 (NEW): combine two ROIParameters by taking the widest bound
-    on each edge — i.e. the smallest enclosing rectangle covering both.
+    Combine two ROIParameters by taking the widest bound on each edge —
+    i.e. the smallest enclosing rectangle covering both.
 
     This is the mechanism that enforces "the floor can only be grown,
     never shrunk below" — used in _compute_base_roi to combine the
-    invariant floor with the lane-based region, and available for reuse
-    wherever a similar guarantee is needed later (e.g. Stage 3 object
-    expansion, which already achieves the same effect via inline
-    min/max operations).
+    invariant floor with the lane-based region.
     """
     x_left  = min(a.x_left, b.x_left)
     x_right = max(a.x_left + a.width, b.x_left + b.width)
@@ -1869,45 +1577,37 @@ def _union_roi(a: ROIParameters, b: ROIParameters, level: int) -> ROIParameters:
 
 
 # ==========================================================================
-# STAGE 8B — Speed plausibility check (NEW, added 2026-08-11)
+# Speed plausibility check
 # ==========================================================================
 
 def _is_speed_plausible(sig: CanSignals,
                          zero_threshold_mps: float = SPEED_ZERO_THRESHOLD_MPS,
                          yaw_threshold_dps: float = YAW_SUGGESTS_MOVING_THRESHOLD_DPS) -> bool:
     """
-    STAGE 8B (NEW): cross-checks a near-zero reported speed against
-    other signals already available on CanSignals, for physical
-    plausibility.
+    Cross-checks a near-zero reported speed against other signals on
+    CanSignals for physical plausibility.
 
-    Addresses the specific hazard identified in review_note.md Section
-    19.4: a brief restart while the vehicle is genuinely moving could
-    leave speed_mps momentarily reading zero — because CAN has not yet
-    resumed delivering valid data — while the vehicle is actually
-    travelling at speed. A floor sized for a stationary vehicle, on a
-    vehicle actually moving fast, would be dangerously short.
+    A brief restart while the vehicle is genuinely moving could leave
+    speed_mps momentarily reading zero — because CAN has not yet resumed
+    delivering valid data — while the vehicle is actually travelling at
+    speed. A floor sized for a stationary vehicle would be dangerously
+    short in that case.
 
-    Two independent physical cross-checks, using nothing beyond what
-    this module already reads from CanSignals:
+    Two independent physical cross-checks:
 
-      1. A vehicle rotating meaningfully (yaw rate above a small
-         threshold) cannot simultaneously be genuinely stationary.
-      2. ESC and ABS are stability-control and anti-lock braking
-         systems; neither engages at a genuine standstill. Either
-         being active while speed reads ~0 is itself evidence the
-         zero reading is not trustworthy.
+      1. A vehicle rotating meaningfully (yaw rate above a small threshold)
+         cannot simultaneously be genuinely stationary.
+      2. ESC and ABS are stability-control and anti-lock braking systems;
+         neither engages at a genuine standstill. Either being active while
+         speed reads ~0 is evidence the zero reading is not trustworthy.
 
     DELIBERATELY LIMITED SCOPE: this function only ever questions a
-    reported speed that is approximately zero. It does not attempt to
-    validate any other speed value — that would be a much broader
-    plausibility problem this module has no independent way to check,
-    and is not the specific hazard being addressed here. A speed
-    reading of, say, 80 km/h is accepted at face value regardless of
-    what the other signals say.
+    reported speed that is approximately zero. A speed reading of, say,
+    80 km/h is accepted at face value regardless of what other signals say.
 
     Returns True (plausible, use as reported) in every case except:
-    speed reads at or below zero_threshold_mps AND at least one of the
-    two cross-checks suggests the vehicle is very likely actually moving.
+    speed reads at or below zero_threshold_mps AND at least one cross-check
+    suggests the vehicle is very likely actually moving.
     """
     if sig.speed_mps > zero_threshold_mps:
         return True  # not reporting near-zero at all — nothing to question
@@ -1923,17 +1623,14 @@ def _is_speed_plausible(sig: CanSignals,
 
 def _effective_speed_mps(sig: CanSignals) -> Tuple[float, bool]:
     """
-    STAGE 8B (NEW): returns (effective_speed_mps, was_implausible) —
-    the speed value every downstream calculation in this module should
-    actually use.
+    Returns (effective_speed_mps, was_implausible) — the speed value every
+    downstream calculation should use.
 
     If the reported speed passes _is_speed_plausible(), it is returned
     unchanged and was_implausible=False. Otherwise,
     DEFAULT_ASSUMED_SPEED_MPS_ON_IMPLAUSIBLE_ZERO is returned instead,
     and was_implausible=True — allowing the caller to both use a safe
-    speed value AND know that the substitution happened, for the same
-    "inspectable, not silent" reasons as FloorClampDiagnostics
-    (Section 22).
+    speed value AND know that the substitution happened.
     """
     if _is_speed_plausible(sig):
         return sig.speed_mps, False
@@ -1946,12 +1643,8 @@ def _effective_speed_mps(sig: CanSignals) -> Tuple[float, bool]:
 
 def _yaw_steering_mismatch_dps(sig: CanSignals) -> float:
     """
-    STAGE 2 (partially added here as a foundation): returns the signed
-    mismatch in degrees/sec between measured yaw rate and the yaw rate
-    the bicycle model predicts from steering angle. Previously this
-    information was discarded — _yaw_is_reliable() returned only a
-    boolean. The magnitude is needed for Stage 2's confidence scoring;
-    exposing it now avoids a breaking change to this function later.
+    Returns the signed mismatch in degrees/sec between measured yaw rate
+    and the yaw rate the bicycle model predicts from steering angle.
 
     Returns 0.0 if either signal is unavailable (treated as "no evidence
     of mismatch" rather than "mismatch confirmed absent" — callers
@@ -1979,15 +1672,15 @@ def _yaw_is_reliable(sig: CanSignals) -> bool:
 
 
 # ==========================================================================
-# STAGE 2 — Unified confidence score (NEW)
+# Unified confidence score
 # ==========================================================================
 
 def _dynamics_confidence(sig: CanSignals) -> float:
     """
-    Confidence in the CURRENT VEHICLE DYNAMICS reading (i.e. whether
-    the CAN-derived curvature can be trusted as reflecting the road,
-    as opposed to a slipping/unstable vehicle whose signals reflect
-    confused vehicle motion instead — see review_note.md Section 4.1).
+    Confidence in the current vehicle dynamics reading — whether the
+    CAN-derived curvature can be trusted as reflecting the road, as
+    opposed to a slipping/unstable vehicle whose signals reflect confused
+    vehicle motion.
 
     Combines two independent pieces of evidence, taking the more
     conservative (lower) of the two wherever both apply:
@@ -1995,15 +1688,12 @@ def _dynamics_confidence(sig: CanSignals) -> float:
          the tier boundaries).
       2. ESC/ABS intervention flags, which are direct evidence of
          reduced tyre grip regardless of what the mismatch calculation
-         shows (a vehicle can be slipping in a way the simple bicycle-
-         model mismatch check does not fully capture).
+         shows.
 
     Returns 1.0 (full confidence) when yaw/steering signals are
     unavailable — absence of evidence is treated as no reason to
-    distrust the dynamics, not as evidence of instability. This
-    matches the module's existing convention in
-    _yaw_steering_mismatch_dps(), which returns 0.0 mismatch (not an
-    error) when inputs are missing.
+    distrust the dynamics, consistent with _yaw_steering_mismatch_dps()
+    returning 0.0 (not an error) when inputs are missing.
     """
     confidence = 1.0
 
@@ -2026,17 +1716,9 @@ def _dynamics_confidence(sig: CanSignals) -> float:
 
 def _estimate_confidence(sig: CanSignals, lane: LaneInfo) -> float:
     """
-    STAGE 2 core function. Produces the single, unified 0.0-1.0
-    confidence score that drives BOTH the corridor-width widening (via
-    _corridor_half_width_m) AND the region-blending logic in
-    _compute_base_roi (replacing the old hard LANE_CONF_MIN switch).
-
-    This deliberately replaces what earlier design discussion had
-    treated as two separate systems — a "dynamics confidence" system
-    and a "degradation-tier confidence" system — with one combined
-    score, per the consolidation decision recorded in review_note.md
-    Section 4.8 ("two independent mechanisms both answered the
-    question 'how uncertain am I right now'").
+    Produces the single, unified 0.0-1.0 confidence score that drives
+    both the corridor-width widening (via _corridor_half_width_m) and
+    the region-blending logic in _compute_base_roi.
 
     Combines, conservatively (minimum, not average — the weakest
     signal governs, consistent with this module's "widen rather than
@@ -2051,27 +1733,22 @@ def _estimate_confidence(sig: CanSignals, lane: LaneInfo) -> float:
 
 
 # ==========================================================================
-# STAGE 5 — Curvature source fusion (NEW)
+# Curvature source fusion
 # ==========================================================================
 
 def _curvature_agreement_confidence(can_curvature: float,
                                      vision_curvature: Optional[float]) -> float:
     """
-    STAGE 5 (NEW): a THIRD, distinct confidence question, separate from
-    both _dynamics_confidence (question 1: can I trust CAN's curvature
-    reading?) and _estimate_confidence (question 2: should I trust the
-    lane-detected centre position?). This one asks: "do my two
-    independent curvature sources (CAN and vision) actually agree with
-    each other?" A large disagreement is itself informative — it
-    usually means the road geometry is changing in a way neither
-    source alone captures well (an S-curve transition, a highway fork,
-    wet-road phantom lane markings — see review_note.md's earlier
-    scenario analysis, Scenarios 2.1/2.2/5.3).
+    A distinct confidence question: "do the two independent curvature
+    sources (CAN and vision) actually agree?" A large disagreement is
+    informative — it usually means road geometry is changing in a way
+    neither source alone captures well (S-curve transition, highway fork,
+    wet-road phantom lane markings).
 
     Returns 1.0 (no reason to distrust) when vision curvature is
     unavailable — absence of a second opinion is not evidence of
-    disagreement, consistent with this module's existing convention
-    for missing-signal cases elsewhere (e.g. _yaw_steering_mismatch_dps).
+    disagreement, consistent with _yaw_steering_mismatch_dps returning 0.0
+    when inputs are missing.
     """
     if vision_curvature is None:
         return 1.0
@@ -2088,37 +1765,28 @@ def _curvature_agreement_confidence(can_curvature: float,
 def _fuse_curvature(can_curvature: float, lane: LaneInfo,
                      dynamics_conf: float) -> Tuple[float, float]:
     """
-    STAGE 5 core function. Combines the CAN bicycle-model curvature
-    (available before inference, but only reflects curvature AT the
-    vehicle's current position — see review_note.md Section 7.2) with
+    Combines the CAN bicycle-model curvature (available before inference,
+    but only reflects curvature at the vehicle's current position) with
     the previous frame's vision-based curvature estimate (genuine
     look-ahead, but one frame stale and dependent on lane-detection
     quality).
 
     Returns (fused_curvature, curvature_confidence):
-      fused_curvature   — the single curvature value to use everywhere
-                            curvature is needed (the floor's lateral
-                            bound AND the lane-based lateral shift).
-      curvature_confidence — combines dynamics_conf (question 1) with
-                            the CAN/vision agreement confidence (the
-                            new question above) via minimum, consistent
-                            with this module's established pattern for
-                            combining independent uncertainty sources.
-                            This is what actually gets passed to
-                            _invariant_floor's corridor-width scaling.
+      fused_curvature      — the single curvature value to use everywhere
+                             curvature is needed (the floor's lateral bound
+                             AND the lane-based lateral shift).
+      curvature_confidence — combines dynamics_conf with the CAN/vision
+                             agreement confidence via minimum, consistent
+                             with this module's pattern for combining
+                             independent uncertainty sources.
 
-    SOURCE SELECTION RULE (deliberately simple — see design discussion
-    in review_note.md Section 14 planning notes): prefer vision
-    whenever it is reasonably confident, REGARDLESS of vehicle
-    stability. This is simpler than an explicit "invert the hierarchy
-    during slip" rule, and produces the same practical outcome: vision
-    reflects the actual road regardless of how the vehicle is moving,
-    so there is no scenario where CAN should be preferred over a
-    confident vision reading. The slip-specific danger (CAN curvature
-    reflecting confused vehicle motion, not the road) is handled by
-    dynamics_conf separately widening the corridor and, in the most
-    severe cases, triggering Level 3 — not by this function picking a
-    different source during slip.
+    SOURCE SELECTION RULE: prefer vision whenever it is reasonably
+    confident, regardless of vehicle stability. Vision reflects the
+    actual road regardless of how the vehicle is moving, so there is no
+    scenario where CAN should be preferred over a confident vision
+    reading. The slip-specific danger (CAN curvature reflecting confused
+    vehicle motion) is handled by dynamics_conf widening the corridor
+    and, in the most severe cases, triggering Level 3.
     """
     vision_curvature = lane.c2_curvature if lane is not None else None
     vision_confidence = lane.c2_confidence if lane is not None else 0.0
@@ -2146,52 +1814,33 @@ def _lateral_speed_scale(speed_mps: float) -> float:
     return 1.0 - (1.0 - MIN_WIDTH_SCALE_AT_MAX_SPEED) * _speed_norm(speed_mps)
 
 
-# NOTE: _depth_ratio(), DEPTH_RATIO_BASE, DEPTH_RATIO_MIN, and
-# SKY_CLIP_Y_TOP have been REMOVED in Stage 1. The vertical extent is
-# now derived by _invariant_floor() from actual speed and camera
-# geometry, replacing this heuristic entirely (see module docstring,
-# "Deleted in Stage 1").
 
 
 # ==========================================================================
-# STAGE 8B — Off-centre (c0) estimation (NEW, added 2026-08-11)
+# Off-centre (c0) estimation
 # ==========================================================================
 
 def _estimate_c0_m(lane: LaneInfo, camera: CameraIntrinsics,
                     z_near_m: float = Z_NEAR_CUTOFF_M) -> float:
     """
-    STAGE 8B (NEW): estimates c0 — the vehicle's lateral offset from the
-    lane centre, in the standard lane polynomial
-    x_lane(Z) = c0 + c1*Z + c2*Z^2 — using the lane detector's reported
-    near-field centre position and the inverse pinhole projection.
+    Estimates c0 — the vehicle's lateral offset from the lane centre in
+    the standard lane polynomial x_lane(Z) = c0 + c1*Z + c2*Z^2 — using
+    the lane detector's near-field centre position and inverse pinhole
+    projection.
 
-    Found as a gap during the 2026-08-10 code review: the floor
-    computation already has a place for this term (lane_c0_m, passed
-    into _invariant_floor), but it was always fed a fixed 0.0, meaning
-    the floor assumed the vehicle sits exactly in the centre of its
-    lane. This function replaces that fixed assumption with an actual
-    estimate.
+    APPROXIMATION: `lane.center_norm` is treated as the lane centre
+    position at z_near_m specifically, and the c1*Z and c2*Z^2
+    contributions at that short range are ignored. This is reasonable
+    because z_near_m is small and because this module does not yet
+    separately estimate c1 (heading) — lane_c1_rad=0.0 in
+    _compute_base_roi. The approximation is no worse than the assumption
+    it sits alongside.
 
-    APPROXIMATION, stated plainly: `lane.center_norm` is treated as the
-    lane centre position at z_near_m specifically, and the c1*Z and
-    c2*Z^2 contributions at that short range are ignored — i.e. this
-    computes x_lane(z_near_m) and uses it directly as c0, rather than
-    solving for the true c0 term in isolation. This is reasonable
-    because z_near_m is small (a few metres) and because this module
-    does not yet separately estimate c1 (heading) either — see the
-    lane_c1_rad=0.0 note in _compute_base_roi. This approximation is
-    no worse than the assumption it sits alongside, and is a strict
-    improvement over the fixed 0.0 it replaces.
+    Sign convention: if the lane appears to the RIGHT of the image's
+    principal point (u_px > principal_x_px), c0 is positive — matching
+    the positive-X-projects-right convention used throughout this module.
 
-    Sign convention check: if the lane appears to the RIGHT of the
-    image's principal point (u_px > principal_x_px), the lane is
-    physically to the right of the vehicle's current position, so c0
-    should be positive — matching the same positive-X-projects-right
-    convention already used throughout this module (e.g.
-    _project_lateral_to_pixel).
-
-    Returns 0.0 (ego assumed centred — the prior, unchanged behaviour)
-    if the lane centre is unavailable.
+    Returns 0.0 if the lane centre is unavailable.
     """
     if lane is None or lane.center_norm is None:
         return 0.0
@@ -2226,16 +1875,12 @@ def _compute_curvature(sig: CanSignals) -> float:
 def _lateral_offset_norm(sig: CanSignals, lane_width_norm: float,
                           curvature_override: Optional[float] = None) -> float:
     """
-    STAGE 5 CHANGE: accepts an optional `curvature_override`. When
-    provided (by _compute_base_roi, using _fuse_curvature's result),
-    this is used INSTEAD of recomputing curvature from CAN signals
-    alone — ensuring the lane-based lateral shift and the invariant
-    floor's lateral bound both use the SAME fused curvature value,
-    rather than the floor using vision-aware fusion while this
-    function silently kept using CAN-only curvature underneath it.
-    When omitted (default), behaviour is IDENTICAL to Stages 1-4 —
-    existing callers and tests that call this function directly are
-    unaffected.
+    Accepts an optional `curvature_override`. When provided (by
+    _compute_base_roi, using _fuse_curvature's result), it is used
+    INSTEAD of recomputing curvature from CAN signals alone — ensuring
+    the lane-based lateral shift and the invariant floor's lateral bound
+    both use the same fused curvature value. When omitted, curvature is
+    computed from CAN signals directly.
     """
     speed = sig.speed_mps
     if speed < MIN_SPEED_FOR_PREVIEW_MPS:
@@ -2259,15 +1904,14 @@ def _lateral_offset_norm(sig: CanSignals, lane_width_norm: float,
 
 
 # ==========================================================================
-# Base ROI  (STAGE 1 — REWIRED to combine the invariant floor with the
-#            existing lane-based calculation)
+# Base ROI
 # ==========================================================================
 
-DEFAULT_LANE_WIDTH_NORM_FALLBACK = 0.3  # STAGE 2 (NEW): used only as a
-    # metres-to-normalised-units scale factor inside _lateral_offset_norm()
-    # when lane.width_norm is unavailable — NOT a trust signal. This lets
-    # the CAN-only curvature shift still be computed in normalised image
-    # units even when the lane detector has provided nothing at all.
+DEFAULT_LANE_WIDTH_NORM_FALLBACK = 0.3  # used only as a metres-to-normalised-
+    # units scale factor inside _lateral_offset_norm() when lane.width_norm
+    # is unavailable — NOT a trust signal. Allows the CAN-only curvature
+    # shift to be computed in normalised image units even when the lane
+    # detector has provided nothing at all.
 
 
 def _compute_base_roi(
@@ -2281,45 +1925,26 @@ def _compute_base_roi(
     quantize_inputs: bool = False,
 ) -> Tuple[ROIParameters, int]:
     """
-    STAGE 2 REWRITE. Replaces the old hard switch
-    (`if lane.confidence < LANE_CONF_MIN: return static_roi, 2`) with
-    continuous confidence-weighted blending between a lane-informed
-    region and a CAN-only fallback region, plus a new Level 3
-    (full-frame) fallback for genuinely catastrophic input loss.
+    Applies continuous confidence-weighted blending between a lane-informed
+    region and a CAN-only fallback region, plus a Level 3 (full-frame)
+    fallback for genuinely catastrophic input loss.
 
-    STAGE 8B (NEW): accepts an optional `diagnostics` parameter,
-    passed straight through to _invariant_floor() when a camera is
-    provided. Default None preserves exact prior behaviour for every
-    existing caller. See FloorClampDiagnostics's docstring for what
-    this records and why.
+    The optional `diagnostics` parameter is passed straight through to
+    _invariant_floor() when a camera is provided. When `quantize_inputs`
+    is True, the floor is computed via _floor_envelope_for_curvature_band()
+    instead of _invariant_floor() directly — grouping speed, curvature, and
+    confidence into a small, fixed set of bands first. This is deliberately
+    opt-in: it trades a small amount of extra conservatism for a finite,
+    exhaustively-checkable input domain and a guarantee that the result
+    cannot change unless the vehicle moves into a different band.
 
-    STAGE 8B (NEW): accepts an optional `quantize_inputs` parameter
-    (default False, preserving EXACT prior behaviour — including every
-    existing hand-calculated test value throughout this project, which
-    assumes the unquantized formula). When True, the floor is computed
-    via _floor_envelope_for_curvature_band() instead of calling
-    _invariant_floor() directly — grouping speed, curvature, and
-    confidence into a small, fixed set of bands first, per the
-    manager's suggestion (review_note.md Sections 19-20). This is
-    deliberately opt-in rather than the default: it trades a small
-    amount of extra conservatism (see Section 20's measured costs) for
-    a finite, exhaustively-checkable input domain and a guarantee that
-    the result cannot change unless the vehicle moves into a different
-    band — properties a caller must deliberately choose, not one
-    silently imposed on every existing user of this function.
-
-    This fixes the specific defect documented in review_note.md
-    Section 2.4 ("Problem one"): CAN curvature is now ALWAYS computed
-    and ALWAYS contributes to lateral positioning, regardless of lane
-    detection confidence — previously, low lane confidence caused an
-    early return that discarded perfectly good curvature information.
+    CAN curvature is always computed and always contributes to lateral
+    positioning, regardless of lane detection confidence.
 
     --- Three separate confidence questions, deliberately kept distinct ---
-    A single blended "how uncertain am I" number was considered and
-    rejected during design (see review_note.md Section 4.8's
-    consolidation discussion) BECAUSE collapsing these into one number
-    creates a new bug: a total lane-detection dropout (lane.confidence
-    -> 0) with perfectly healthy CAN signals would otherwise force the
+    Collapsing these into one number would create a bug: a total
+    lane-detection dropout (lane.confidence -> 0) with perfectly healthy
+    CAN signals would otherwise force the
     same drastic response as a genuine total system failure, when in
     fact a CAN-only corridor is a perfectly good fallback in that case.
 
@@ -2339,34 +1964,26 @@ def _compute_base_roi(
          -> drives the BLEND WEIGHT between lane-informed and
             CAN-only lateral centring. Using min() here is correct:
             if EITHER source is compromised, trust the lane position
-            less — a confident-looking lane detection paired with an
-            untrustworthy curvature estimate for the shift term is
-            not fully trustworthy either.
+            less.
 
       3. "Is NOTHING reliable — should I give up on any positioning
           guess and just process the whole frame?"
          -> triggered by dynamics_conf ALONE, not overall_conf. A
             lane dropout with healthy CAN signals must NOT trigger
             this — the CAN-only fallback (question 2's low end) is
-            exactly the correct, graceful response to that case, and
-            using overall_conf here would trigger full-frame far too
-            often (every time lane detection has a bad frame).
+            exactly the correct, graceful response to that case.
 
     `static_roi` is retained in the signature for backward API
-    compatibility but is no longer used substantively — per
-    review_note.md Section 5.3 ("the static ROI is caller-defined, not
-    system-defined... the system should enforce a minimum safe static
-    ROI internally"), both the CAN-only fallback (Level 2) and the
-    full-frame fallback (Level 3) are now computed internally rather
-    than relying on a caller-supplied rectangle.
+    compatibility but is not used substantively — both the CAN-only
+    fallback (Level 2) and the full-frame fallback (Level 3) are
+    computed internally rather than relying on a caller-supplied
+    rectangle.
 
-    STAGE 8B (NEW): before anything else runs, the reported speed is
-    passed through _effective_speed_mps() — a near-zero reading judged
-    physically implausible (see _is_speed_plausible) is replaced with
-    a conservative default for the REST OF THIS FUNCTION's purposes.
-    This is done by constructing a corrected copy of `sig` via
-    dataclasses.replace() rather than mutating the caller's object —
-    the caller's original CanSignals instance is left untouched.
+    Before anything else runs, the reported speed is passed through
+    _effective_speed_mps() — a near-zero reading judged physically
+    implausible is replaced with a conservative default. This is done
+    by constructing a corrected copy of `sig` via dataclasses.replace()
+    rather than mutating the caller's object.
     """
     effective_speed, speed_was_implausible = _effective_speed_mps(sig)
     if speed_was_implausible:
@@ -2390,7 +2007,7 @@ def _compute_base_roi(
 
     # --- Lane-informed lateral centring (used when trusted) ---
     lane_width_for_shift = lane.width_norm if lane.width_norm is not None else DEFAULT_LANE_WIDTH_NORM_FALLBACK
-    shift = _lateral_offset_norm(sig, lane_width_for_shift, curvature_override=curvature)  # STAGE 5: uses fused curvature
+    shift = _lateral_offset_norm(sig, lane_width_for_shift, curvature_override=curvature)  # uses fused curvature
 
     if lane.center_norm is not None and lane.width_norm is not None:
         lane_cx = lane.center_norm
@@ -2430,24 +2047,21 @@ def _compute_base_roi(
     if camera is None:
         # No camera intrinsics: fall back to lateral-only positioning
         # with a conservative vertical placeholder — temporary
-        # compatibility path, not a supported long-term mode (see
-        # Stage 1 notes; unchanged in Stage 2).
+        # compatibility path, not a supported long-term mode.
         lane_based_roi = _roi_from_center(cx, half_w, y_top=0.05, height=0.90, level=level)
         lane_based_roi = replace(lane_based_roi, speed_was_implausible=speed_was_implausible)
         return lane_based_roi, level
 
     _validate_camera_intrinsics(camera)
 
-    c0_estimate = _estimate_c0_m(lane, camera)  # STAGE 8B: replaces the
-        # previous fixed 0.0 — see _estimate_c0_m's docstring for the
-        # approximation this relies on.
+    c0_estimate = _estimate_c0_m(lane, camera)  # see _estimate_c0_m's docstring
+        # for the approximation this relies on.
 
     if quantize_inputs:
-        # STAGE 8B (NEW): grouped-input path. NOTE: `diagnostics` is
-        # not populated on this path — FloorClampDiagnostics records
-        # the clamp status of a SINGLE evaluation, and the envelope
-        # approach deliberately combines several; there is no single
-        # "the" raw value left to report once they have been unioned.
+        # Grouped-input path. NOTE: `diagnostics` is not populated here —
+        # FloorClampDiagnostics records the clamp status of a SINGLE
+        # evaluation, and the envelope approach combines several; there is
+        # no single "the" raw value to report once they have been unioned.
         # A caller needing FOV clamp visibility should use the default
         # (quantize_inputs=False) path.
         x_left, x_right, y_top, y_bottom = _floor_envelope_for_curvature_band(
@@ -2469,20 +2083,15 @@ def _compute_base_roi(
             lane_c1_rad=0.0,
             abs_active=effective_abs_active,
             isa_enabled=isa_enabled,
-            confidence=curvature_conf,  # STAGE 5: now incorporates BOTH dynamics
-                                         # confidence (question 1) AND CAN/vision
-                                         # agreement confidence (question 3) via
-                                         # _fuse_curvature's min() combination —
-                                         # a curvature-source disagreement widens
-                                         # the corridor exactly like a dynamics
-                                         # reliability problem does.
-            diagnostics=diagnostics,  # STAGE 8B: passthrough, None by default
+            confidence=curvature_conf,  # incorporates both dynamics confidence
+                                         # and CAN/vision agreement confidence via
+                                         # _fuse_curvature's min() combination
+            diagnostics=diagnostics,
         )
     floor_roi = _roi_from_edges(x_left, x_right, y_top, y_bottom, level)
 
-    # Vertical extent comes exclusively from the floor (unchanged Stage 1
-    # rule — see Stage 1 verification notes on why this must not be
-    # unioned with a wide placeholder). Only the lateral bound is unioned
+    # Vertical extent comes exclusively from the floor — it must not be
+    # unioned with a wide placeholder. Only the lateral bound is unioned
     # with the blended lane/fallback centring above.
     lane_x_left  = _clamp(cx - half_w)
     lane_x_right = _clamp(cx + half_w)
@@ -2503,32 +2112,24 @@ def _compute_base_roi(
 
 # ==========================================================================
 # Per-category expansion functions  (TTC-aware for VEHICLE)
-# STAGE 3 IMPLEMENTED: corridor-membership + confirmed-track + valid-TTC
-# gating added for vehicle expansion — see _is_in_corridor() and
-# _apply_object_expansions() below.
 # ==========================================================================
 
 def _is_in_corridor(bbox: Tuple[float, float, float, float],
                      corridor_x_left: float,
                      corridor_x_right: float) -> bool:
     """
-    STAGE 3 (NEW): is the detection's horizontal centre laterally
-    inside the driving corridor?
+    Is the detection's horizontal centre laterally inside the driving
+    corridor?
 
-    This is the core fix for the documented parked-vehicle bug
-    (review_note.md Section 2.5 / 5.2): a car parked on the roadside,
-    well outside the corridor, should not cause the region to expand
-    toward it. Only vehicles whose centre falls within the corridor
-    bounds are even considered for expansion.
+    A car parked on the roadside, well outside the corridor, should not
+    cause the region to expand toward it. Only vehicles whose centre falls
+    within the corridor bounds are considered for expansion.
 
     IMPORTANT: `corridor_x_left`/`corridor_x_right` must be captured
     ONCE per frame, BEFORE any expansion is applied that frame — not
     read from a `roi` that is being progressively widened inside the
-    same expansion loop. If the corridor bounds were re-read after an
-    earlier expansion, a genuinely parked vehicle could wrongly "pass"
-    the membership test simply because an earlier, unrelated expansion
-    had already widened the region. See _apply_object_expansions()
-    for where this capture happens.
+    same expansion loop. See _apply_object_expansions() for where this
+    capture happens.
     """
     bx1, _, bx2, _ = bbox
     obj_cx = (bx1 + bx2) * 0.5
@@ -2620,7 +2221,7 @@ def _expand_sign_overhead(
 
 
 # ==========================================================================
-# Expansion dispatch  (TTC-aware, STAGE 3: corridor-gated for vehicles)
+# Expansion dispatch  (TTC-aware, corridor-gated for vehicles)
 # ==========================================================================
 
 _CATEGORY_ORDER = (
@@ -2643,41 +2244,24 @@ def _apply_object_expansions(
     """
     Expand ROI for each detection that clears its confidence gate.
 
-    STAGE 3 CHANGE: vehicle expansion now additionally requires ALL
-    THREE of the following (previously only the confidence gate
-    applied, which is why a stationary, roadside-parked vehicle with
-    confidence >= DEFAULT_CONF_VEHICLE=0.0 — i.e. any detected vehicle
-    at all — used to expand the region regardless of position or
-    motion):
+    Vehicle expansion additionally requires ALL THREE of the following:
 
       1. The vehicle's centre is laterally inside the driving corridor
          (_is_in_corridor) — a parked car on the shoulder fails this.
       2. Its track has reached CONFIRMED state — a single-frame,
-         possibly-spurious detection fails this (already existing
-         track-lifecycle logic, just now also gating expansion itself
-         rather than only gating TTC estimation).
+         possibly-spurious detection fails this.
       3. A valid (non-None) closing time-to-collision exists — a
          vehicle that is not actually closing (parked, or moving away)
-         fails this, since _estimate_ttc() already returns None for
-         vy<=0 (non-approaching objects).
+         fails this, since _estimate_ttc() returns None for vy<=0.
 
-    Signal and sign categories are UNCHANGED — they remain
-    confidence-gated only, with no corridor or TTC requirement, since
-    those categories do not have an analogous "is this actually a
-    collision threat" question the way an arbitrary detected vehicle
-    does.
+    Signal and sign categories are confidence-gated only, with no
+    corridor or TTC requirement.
 
-    The corridor bounds used for condition 1 are captured ONCE, from
-    the `roi` as it is BEFORE this function applies any expansion —
-    see _is_in_corridor()'s docstring for why re-reading a
-    progressively-widening `roi` inside the loop would be a bug.
-
-    STAGE 7 (NEW): accepts an optional `corridor_bounds` override so
-    that ROIGenerator.step() can capture ONE frozen pre-expansion
-    corridor and share it with both this function AND the new Stage 7
-    occlusion-response/vertical-peek functions, rather than each
-    deriving its own independently. When omitted, behaviour is
-    identical to Stages 1-6 (derives it from `roi` directly).
+    The corridor bounds used for condition 1 are captured ONCE from
+    the `roi` before any expansion is applied. The optional
+    `corridor_bounds` override allows a caller to supply one frozen
+    pre-expansion corridor shared across multiple functions; when
+    omitted, it is derived from `roi` directly.
     """
     if corridor_bounds is not None:
         corridor_x_left, corridor_x_right = corridor_bounds
@@ -2729,31 +2313,23 @@ def _apply_object_expansions(
 
 
 # ==========================================================================
-# STAGE 7 — Sign occlusion response (NEW)
+# Sign occlusion response
 # ==========================================================================
 
 @dataclass
 class _RememberedSign:
     """
-    STAGE 7 (NEW): a single remembered sign detection, keyed by
-    category in ROIGenerator.sign_memory. Deliberately keyed by
-    CATEGORY, not by a per-instance identity — this module does not
-    track individual signs the way it tracks individual vehicles
-    (signs have no Kalman filter, no track_id assignment); one
-    remembered position per sign category is the level of detail this
-    project's occlusion response operates at. Multiple simultaneous
-    roadside signs are outside this scope.
+    A single remembered sign detection, keyed by category in
+    ROIGenerator.sign_memory. Keyed by CATEGORY, not by per-instance
+    identity — signs have no Kalman filter or track_id; one remembered
+    position per sign category is the level of detail this module's
+    occlusion response operates at.
 
-    NOTE: unlike vehicle positions, no ego-motion compensation is
-    applied to the remembered bbox while it ages — the remembered
-    position is used as-is for up to SIGN_MEMORY_MAX_AGE frames. At
-    typical highway speeds and this frame count, the resulting
-    positional error is small relative to the expansion margin already
-    applied, but this is a simplification, not a precise projection —
-    see review_note.md for the fuller design discussion of why a
-    precise ego-motion-compensated version was not built at this
-    stage (the same "prove it's needed first" philosophy used
-    elsewhere in this module).
+    No ego-motion compensation is applied to the remembered bbox while
+    it ages — the remembered position is used as-is for up to
+    SIGN_MEMORY_MAX_AGE frames. At typical highway speeds and this frame
+    count, the resulting positional error is small relative to the
+    expansion margin already applied.
     """
     bbox: Tuple[float, float, float, float]
     frames_since_seen: int = 0
@@ -2765,10 +2341,9 @@ def _update_sign_memory(
     gates: ConfidenceGates,
 ) -> None:
     """
-    STAGE 7 (NEW): mutates `sign_memory` in place — refreshes entries
-    for sign categories seen this frame (above their confidence gate),
-    ages entries not seen this frame, and forgets entries that have
-    exceeded SIGN_MEMORY_MAX_AGE.
+    Mutates `sign_memory` in place — refreshes entries for sign categories
+    seen this frame (above their confidence gate), ages entries not seen
+    this frame, and forgets entries that have exceeded SIGN_MEMORY_MAX_AGE.
     """
     conf_map = {
         ObjectCategory.SIGN_ROADSIDE: gates.sign_roadside,
@@ -2801,12 +2376,10 @@ def _is_large_confirmed_in_corridor_vehicle(
     corridor_x_right: float,
 ) -> bool:
     """
-    STAGE 7 (NEW): shared predicate for both the occlusion response and
-    the vertical peek — a vehicle is treated as a plausible sign
-    occluder only if it is a VEHICLE detection, large enough
-    (LARGE_VEHICLE_HEIGHT_THRESHOLD_NORM), on a CONFIRMED track (same
-    ghost-track guard used throughout this module since Stage 3), and
-    laterally inside the driving corridor.
+    Shared predicate for both the occlusion response and the vertical peek
+    — a vehicle is treated as a plausible sign occluder only if it is a
+    VEHICLE detection, large enough (LARGE_VEHICLE_HEIGHT_THRESHOLD_NORM),
+    on a CONFIRMED track, and laterally inside the driving corridor.
     """
     if obj.category != ObjectCategory.VEHICLE:
         return False
@@ -2830,31 +2403,20 @@ def _apply_occlusion_response(
     corridor_x_right: float,
 ) -> ROIParameters:
     """
-    STAGE 7 (NEW): the unified occlusion response — combining temporal
-    sign memory and large-vehicle-triggered lateral widening into ONE
-    mechanism, per the consolidation decision recorded in
-    review_note.md (five originally-separate mitigations discussed
-    during design reduced to two: this function, and the separate
-    _apply_vertical_peek below, kept apart because the geometry is
-    genuinely different — lateral reach for redundant opposite-side
-    signs vs. vertical reach for overhead gantries).
-
-    Two things happen, both purely additive (union-style growth, same
-    "can only grow, never shrink below what came before" discipline
-    used throughout this module):
+    The unified occlusion response, combining temporal sign memory and
+    large-vehicle-triggered lateral widening. Two things happen, both
+    purely additive (union-style growth — the region can only grow):
 
       1. Any sign category still within SIGN_MEMORY_MAX_AGE of last
          being directly seen has the region expanded to still cover
          its last-known position — bridging a brief occlusion rather
-         than immediately forgetting the sign the instant it is
-         blocked for even one frame.
+         than immediately forgetting the sign.
 
       2. If a large, confirmed, in-corridor vehicle is present (a
-         plausible occluder for anything behind it), the region is
-         proactively widened laterally by OCCLUSION_LATERAL_WIDEN_NORM
-         on both sides — approximating reach toward an IRC 67-mandated
-         opposite-side redundant sign that the large vehicle might be
-         blocking on ONE side, without needing to know which side.
+         plausible occluder), the region is proactively widened
+         laterally by OCCLUSION_LATERAL_WIDEN_NORM on both sides —
+         approximating reach toward an IRC 67-mandated opposite-side
+         redundant sign without needing to know which side is blocked.
     """
     for category, remembered in sign_memory.items():
         if remembered.frames_since_seen <= SIGN_MEMORY_MAX_AGE:
@@ -2885,17 +2447,15 @@ def _apply_vertical_peek(
     corridor_x_right: float,
 ) -> ROIParameters:
     """
-    STAGE 7 (NEW): extends the region's top edge upward above a large,
-    confirmed, in-corridor tracked vehicle, so an overhead gantry sign
-    partially visible above the vehicle (per IRC 67's minimum gantry
-    clearance vs. typical truck height — see OCCLUSION_VERTICAL_PEEK_NORM)
-    stays inside the region. Kept SEPARATE from _apply_occlusion_response
-    per the consolidation decision — genuinely different geometry
-    (vertical extension vs. lateral reach), not an arbitrary split.
+    Extends the region's top edge upward above a large, confirmed,
+    in-corridor tracked vehicle, so an overhead gantry sign partially
+    visible above the vehicle (per IRC 67's minimum gantry clearance vs.
+    typical truck height — see OCCLUSION_VERTICAL_PEEK_NORM) stays inside
+    the region. Kept separate from _apply_occlusion_response because the
+    geometry is genuinely different: vertical extension vs. lateral reach.
 
-    The region's BOTTOM edge is deliberately held fixed while extending
-    the top — this is an extension of the existing region upward, not a
-    shift of the whole region.
+    The region's BOTTOM edge is held fixed — this extends the region
+    upward, not shifts it.
     """
     for obj in tracked_objects:
         if not _is_large_confirmed_in_corridor_vehicle(obj, registry, corridor_x_left, corridor_x_right):
@@ -2915,7 +2475,7 @@ def _apply_vertical_peek(
 
 
 # ==========================================================================
-# STAGE 8 — Region size cap (NEW)
+# Region size cap
 # ==========================================================================
 
 def _apply_area_cap(
@@ -2924,33 +2484,26 @@ def _apply_area_cap(
     max_area_fraction: float = MAX_ROI_AREA_FRACTION,
 ) -> ROIParameters:
     """
-    STAGE 8 (NEW): caps the FINAL region's area (after all object,
-    occlusion, and peek expansions) to at most `max_area_fraction` of
-    the full frame — preventing several simultaneous, individually
-    reasonable-looking expansions from silently combining toward
-    full-frame.
+    Caps the FINAL region's area (after all object, occlusion, and peek
+    expansions) to at most `max_area_fraction` of the full frame —
+    preventing several simultaneous, individually reasonable-looking
+    expansions from silently combining toward full-frame.
 
     CRITICAL SAFETY PROPERTY: this can NEVER shrink below `base_roi`
-    (the floor+lane baseline, captured before any expansion this
-    frame) on any edge. This is guaranteed BY CONSTRUCTION, not by a
-    runtime check that could have an edge case: the function only ever
-    scales the four MARGIN amounts (how far `roi` extends beyond
-    `base_roi` on each side) toward zero, and a margin can never become
-    negative. If `base_roi` itself already exceeds `max_area_fraction`
-    (e.g. a very low-confidence corridor, or Level 3's full-frame
-    fallback), the cap has no effect at all — the floor always wins,
-    exactly as intended.
+    (the floor+lane baseline, captured before any expansion this frame)
+    on any edge. Guaranteed by construction: the function only ever scales
+    the four MARGIN amounts (how far `roi` extends beyond `base_roi` on
+    each side) toward zero, and a margin can never become negative. If
+    `base_roi` itself already exceeds `max_area_fraction` (e.g. a very
+    low-confidence corridor, or Level 3's full-frame fallback), the cap
+    has no effect at all — the floor always wins.
 
     APPROXIMATION NOTE: the scaling factor is computed as
-    sqrt(target_area / current_area), which exactly holds only when
-    width and height are scaled independently without the base
-    offsets — the true relationship involving the base dimensions has
-    a cross term this does not solve for exactly. This is intentional:
-    Stage 8 is scoped as "a maximum region size limit... region size
-    stays predictable" (review_note.md Section 6), a practical
-    predictability measure, not a precision requirement. The
-    approximation always shrinks margins somewhat when the cap is
-    exceeded; it does not guarantee hitting the cap exactly.
+    sqrt(target_area / current_area), which holds exactly only when width
+    and height are scaled independently without base offsets. This is
+    intentional — a practical predictability measure, not a precision
+    requirement. The approximation always shrinks margins somewhat when the
+    cap is exceeded; it does not guarantee hitting the cap exactly.
     """
     base_x_left, base_x_right = base_roi.x_left, base_roi.x_left + base_roi.width
     base_y_top, base_y_bottom = base_roi.y_top, base_roi.y_top + base_roi.height
@@ -2986,19 +2539,18 @@ def _apply_area_cap(
 
 
 # ==========================================================================
-# STAGE 8 — Bounded resize: mapping a variable ROI to a fixed canonical
-# (accelerator) input size via uniform scaling and letterbox padding (NEW)
+# Bounded resize: mapping a variable ROI to a fixed canonical
+# (accelerator) input size via uniform scaling and letterbox padding
 # ==========================================================================
 
 @dataclass
 class CanonicalMapping:
     """
-    STAGE 8 (NEW): describes how a variable-shaped ROI (in full-frame
-    pixel coordinates) maps onto a fixed canonical (accelerator) input
-    size. Produced by map_roi_to_canonical(); consumed by
-    canonical_bbox_to_fullframe() to convert a detection produced by
-    the model (in canonical pixel coordinates) back into full-frame
-    normalised coordinates for the tracker.
+    Describes how a variable-shaped ROI (in full-frame pixel coordinates)
+    maps onto a fixed canonical (accelerator) input size. Produced by
+    map_roi_to_canonical(); consumed by canonical_bbox_to_fullframe() to
+    convert a detection (in canonical pixel coordinates) back into
+    full-frame normalised coordinates for the tracker.
     """
     crop_x_px:            float
     crop_y_px:            float
@@ -3018,17 +2570,12 @@ def map_roi_to_canonical(
     canonical_height_px: float,
 ) -> CanonicalMapping:
     """
-    STAGE 8 (NEW): converts a normalised ROI into pixel-space crop
-    coordinates, then computes the SINGLE uniform scale factor (never
-    two different scale factors for width/height) that fits the crop
-    within the canonical input size, with any leftover space handled
-    as letterbox padding rather than stretching.
-
-    This is the design decision recorded in review_note.md Section 4.3:
-    stretching would distort object proportions relative to what a
-    detector trained on undistorted images expects; uniform scaling
-    only ever changes SIZE, which detectors handle far better than a
-    SHAPE distortion.
+    Converts a normalised ROI into pixel-space crop coordinates, then
+    computes the single uniform scale factor (never two different scale
+    factors for width/height) that fits the crop within the canonical
+    input size, with any leftover space handled as letterbox padding
+    rather than stretching. Stretching would distort object proportions
+    relative to what a detector trained on undistorted images expects.
     """
     crop_x = roi.x_left * camera.image_width_px
     crop_y = roi.y_top * camera.image_height_px
@@ -3059,16 +2606,13 @@ def canonical_bbox_to_fullframe(
     camera: CameraIntrinsics,
 ) -> Tuple[float, float, float, float]:
     """
-    STAGE 8 (NEW): inverse of map_roi_to_canonical's geometry — converts
-    a detection bbox produced by the model (in canonical pixel
-    coordinates, e.g. 512x256) back into full-frame NORMALISED
-    coordinates, suitable for handing to TrackRegistry/the tracker.
+    Inverse of map_roi_to_canonical's geometry — converts a detection bbox
+    produced by the model (in canonical pixel coordinates) back into
+    full-frame normalised coordinates, suitable for the tracker.
 
-    This is the "track in full-frame coordinates, not crop-relative
-    coordinates" fix already established in this module's design
-    discussion — a detection must be converted back to a common frame
-    before the tracker ever sees it, or crop changes between frames
-    would look like sudden object motion to the Kalman filter.
+    A detection must be converted back to a common frame before the tracker
+    ever sees it, or crop changes between frames would look like sudden
+    object motion to the Kalman filter.
     """
     x1, y1, x2, y2 = bbox_canonical_px
     # Undo padding, undo scale, add back the crop's own offset.
@@ -3086,7 +2630,7 @@ def canonical_bbox_to_fullframe(
 
 
 # ==========================================================================
-# Stability smoothing  (STAGE 4 IMPLEMENTED: asymmetric per-edge filter)
+# Stability smoothing  (asymmetric per-edge filter)
 # ==========================================================================
 
 ASYM_ALPHA_GROW_EDGE   = 0.30   # weight on PREVIOUS value when an edge is
@@ -3107,10 +2651,10 @@ ASYM_ALPHA_SHRINK_EDGE = 0.85   # weight on PREVIOUS value when an edge is
 
 def _blend_edge(prev_val: float, new_val: float, is_growing: bool) -> float:
     """
-    STAGE 4 (NEW): one edge's asymmetric blend. `is_growing` must be
-    determined by the CALLER based on which direction growth means for
-    that specific edge (see _smooth_asymmetric below) — this function
-    itself has no notion of "which way is outward" for a given edge.
+    One edge's asymmetric blend. `is_growing` must be determined by the
+    CALLER based on which direction growth means for that specific edge
+    (see _smooth_asymmetric below) — this function itself has no notion
+    of "which way is outward" for a given edge.
     """
     alpha = ASYM_ALPHA_GROW_EDGE if is_growing else ASYM_ALPHA_SHRINK_EDGE
     return prev_val * alpha + new_val * (1.0 - alpha)
@@ -3118,29 +2662,9 @@ def _blend_edge(prev_val: float, new_val: float, is_growing: bool) -> float:
 
 def _smooth_asymmetric(prev: ROIParameters, new: ROIParameters) -> ROIParameters:
     """
-    STAGE 4 REPLACEMENT for the old _smooth_or_snap(). Applies the
-    fast-grow/slow-shrink filter independently to all FOUR edges
-    (x_left, x_right, y_top, y_bottom) — not just centre-x and width as
-    the old filter did, and NOT the old single alpha + snap-threshold
-    mechanism at all.
-
-    Why this replaces the old approach entirely, per the consolidation
-    decision recorded in review_note.md Section 4.8 / the original
-    design discussion:
-      - The old single alpha (0.70) resisted ALL changes equally,
-        including genuinely urgent ones (e.g. the region needing to
-        widen fast during hard braking) — see review_note.md Section
-        2.7's documented limitation.
-      - The old snap threshold created a discontinuity: a change just
-        below the threshold was heavily smoothed and sluggish, a change
-        just above it snapped instantly with no smoothing at all. There
-        was no continuous middle ground.
-      - Vertical extent (y_top/height) was never smoothed at all in the
-        old version — tolerable only because it used to be a nearly-
-        fixed heuristic (Stage 1 removed that heuristic; the floor's
-        vertical bound is now genuinely speed-dependent, so leaving it
-        unsmoothed would reintroduce jitter Stage 1 didn't have a
-        reason to smooth away yet).
+    Applies the fast-grow/slow-shrink filter independently to all FOUR edges
+    (x_left, x_right, y_top, y_bottom) independently, with fast growth
+    and slow shrink on each edge.
 
     Direction-of-growth convention for each edge, given this module's
     coordinate system (origin top-left, y increasing downward):
@@ -3175,13 +2699,7 @@ def _smooth_asymmetric(prev: ROIParameters, new: ROIParameters) -> ROIParameters
         width=_clamp(x_right_f - x_left_f),
         height=_clamp(y_bottom_f - y_top_f),
         roi_level=new.roi_level,
-        speed_was_implausible=new.speed_was_implausible,  # STAGE 8B (NEW):
-            # previously dropped — found and fixed during the same
-            # implementation session as the field's introduction,
-            # 2026-08-11. ROIGenerator.step() also captures this value
-            # independently before calling this function, as defence in
-            # depth, but this function should not silently discard it
-            # for any OTHER caller either.
+        speed_was_implausible=new.speed_was_implausible,
     )
 
 
@@ -3197,12 +2715,11 @@ class ROIGenerator:
       - TrackRegistry  (Kalman tracks per vehicle detection)
       - prev_roi       (for IIR smoothing)
 
-    STAGE 1 CHANGE: accepts an optional `camera` (CameraIntrinsics).
-    When provided, the invariant floor is computed and combined into
-    the base ROI every frame. When omitted, the module falls back to
-    lane-based-only positioning with no physics-based safety guarantee
-    (see _compute_base_roi docstring) — intended as a temporary
-    compatibility path during rollout, not a supported long-term mode.
+    Accepts an optional `camera` (CameraIntrinsics). When provided, the
+    invariant floor is computed and combined into the base ROI every frame.
+    When omitted, the module falls back to lane-based-only positioning with
+    no physics-based safety guarantee — a temporary compatibility path, not
+    a supported long-term mode.
 
     Usage
     -----
@@ -3214,12 +2731,9 @@ class ROIGenerator:
     BiTrack / external tracker:
         gen = ROIGenerator(camera=my_camera_intrinsics, use_external_tracker=True)
         # Pass DetectedObject with track_id already assigned by BiTrack.
-        # The RETURNED POSITION always trusts the external bbox as-is —
-        # internal filtering never overwrites it. An internal Kalman
-        # filter still runs in the background regardless, purely to
-        # support TTC estimation (see TrackRegistry._update_external's
-        # docstring / the BiTrack note earlier in this file for the
-        # 2026-08-06 correction to this previously-inaccurate claim).
+        # The returned position always trusts the external bbox as-is —
+        # internal filtering never overwrites it. An internal Kalman filter
+        # still runs to support TTC estimation (see _update_external).
     """
 
     def __init__(
@@ -3241,61 +2755,44 @@ class ROIGenerator:
         self.frame_dt_s            = frame_dt_s
         self.abs_active_default    = abs_active_default
         self.isa_enabled           = isa_enabled
-        self.quantize_inputs       = quantize_inputs  # STAGE 8B (NEW, 2026-08-11):
-            # default False preserves exact prior behaviour. When True,
-            # step() computes the floor via the grouped-input envelope
-            # approach instead of the direct per-frame calculation —
-            # see _compute_base_roi's docstring for the full reasoning.
-        self.sign_memory: Dict[ObjectCategory, _RememberedSign] = {}  # STAGE 7 (NEW)
-        self.last_floor_diagnostics: Optional[FloorClampDiagnostics] = None  # STAGE 8B (NEW)
-            # Populated fresh every step() call. Inspect this after
-            # calling step() to find out whether the camera's field of
-            # view was the limiting factor on any side this frame —
-            # see FloorClampDiagnostics's docstring. Remains None if no
-            # camera was provided to this generator (the no-camera
-            # compatibility path does not use the floor at all).
-        self.frames_since_init: int = 0  # STAGE 8B (NEW, 2026-08-11):
-            # incremented at the start of every step() call. Frame 1
-            # (the first call this instance ever processes) is
-            # frames_since_init=1, not 0 — see step() for exactly where
-            # this increments and how it drives is_warmed_up on the
-            # returned ROIParameters.
+        self.quantize_inputs       = quantize_inputs  # when True, step() computes
+            # the floor via the grouped-input envelope approach instead of the
+            # direct per-frame calculation — see _compute_base_roi's docstring.
+        self.sign_memory: Dict[ObjectCategory, _RememberedSign] = {}
+        self.last_floor_diagnostics: Optional[FloorClampDiagnostics] = None
+            # Populated fresh every step() call. Inspect after calling step()
+            # to find out whether the camera's field of view was the limiting
+            # factor on any side this frame. Remains None if no camera was
+            # provided (the no-camera path does not use the floor).
+        self.frames_since_init: int = 0  # incremented at the start of every
+            # step() call. Frame 1 is frames_since_init=1, not 0 — see step()
+            # for how it drives is_warmed_up on the returned ROIParameters.
 
         if camera is not None:
             _validate_camera_intrinsics(camera)
         else:
             warnings.warn(
                 "ROIGenerator constructed without camera intrinsics — "
-                "the invariant collision-coverage floor (Stage 1) will "
-                "NOT be applied, and the physics-based safety guarantee "
-                "this module is designed to provide will not hold. "
-                "Pass camera=CameraIntrinsics(...) to enable it.",
+                "the invariant collision-coverage floor will NOT be applied, "
+                "and the physics-based safety guarantee this module is designed "
+                "to provide will not hold. Pass camera=CameraIntrinsics(...) "
+                "to enable it.",
                 UserWarning,
                 stacklevel=2,
             )
 
     def reset_for_warm_restart(self) -> None:
         """
-        STAGE 8B (NEW, 2026-08-11): implements the state-restoration
-        policy for a brief WARM restart — a software or watchdog reset
-        WITHOUT power loss, where some memory may have survived. See
-        review_note.md Section 19.4 for the full reasoning behind this
-        policy; this method is the enforced, testable version of that
-        written rule, rather than leaving it as a comment someone
-        integrating this code might follow incorrectly by hand.
+        State-restoration policy for a brief WARM restart — a software
+        or watchdog reset WITHOUT power loss, where some memory may have
+        survived.
 
         THE RULE: information that is PHYSICALLY FIXED is safe to keep
-        across a restart, because it cannot have changed in the
-        meantime. Anything TIME-DEPENDENT is not safe to keep, because
-        it may now be stale or actively wrong, and must be reset to a
-        fresh, cautious starting state rather than trusted.
+        across a restart. Anything TIME-DEPENDENT must be reset to a
+        fresh, cautious starting state.
 
-        Call this method after resuming a ROIGenerator instance
-        following a brief warm restart, INSTEAD OF constructing a
-        brand new instance — using this method rather than a fresh
-        instance is only worthwhile because it preserves the
-        configuration below without the caller needing to remember
-        and re-supply it.
+        Call this instead of constructing a brand new instance — it
+        preserves configuration without the caller needing to re-supply it.
 
         SAFE TO KEEP — left completely untouched by this method:
           - self.camera               (camera calibration; physically fixed)
@@ -3320,31 +2817,22 @@ class ROIGenerator:
                                         tracked objects)
           - self.frames_since_init    (a warm restart IS a fresh start
                                         for warm-up purposes — see
-                                        Section 23's is_warmed_up
-                                        reasoning; established history
-                                        from before the restart cannot
+                                        is_warmed_up reasoning; established
+                                        history from before the restart cannot
                                         be assumed to still apply)
           - self.last_floor_diagnostics (stale by definition once
                                         frames_since_init resets)
 
-        DELIBERATELY NOT ADDRESSED HERE: previous-frame vision
-        curvature sits in a genuine grey area (Section 19.4) — safe to
-        keep ONLY if the interruption was extremely brief, since the
-        vehicle has then moved a negligible distance. This module has
-        no way to measure how long the interruption actually lasted,
-        so it cannot safely make that judgement on the caller's
-        behalf. Critically, this value is not held as state INSIDE
-        ROIGenerator at all — it lives on the LaneInfo object the
-        caller constructs fresh and passes into step() every single
-        frame. There is nothing here for this method to reset; the
-        calling system itself must decide, based on its own knowledge
-        of how long the interruption lasted, whether to pass a
-        genuinely remembered curvature value or None on the first
-        call after a warm restart.
+        DELIBERATELY NOT ADDRESSED HERE: previous-frame vision curvature
+        is not held as state inside ROIGenerator — it lives on the LaneInfo
+        object the caller constructs fresh and passes into step() every
+        frame. The calling system must decide, based on its own knowledge
+        of how long the interruption lasted, whether to pass a remembered
+        curvature value or None on the first call after a warm restart.
 
-        The IoU matching threshold originally supplied at construction
-        is preserved when the tracker is reset, since that is
-        configuration, not time-dependent state.
+        The IoU matching threshold originally supplied at construction is
+        preserved when the tracker is reset, since that is configuration,
+        not time-dependent state.
         """
         self.registry = TrackRegistry(self.registry.iou_thresh)
         self.prev_roi = None
@@ -3364,25 +2852,18 @@ class ROIGenerator:
         Process one frame.  Returns ROIParameters with roi_level.
 
         abs_active: if provided, overrides the constructor's
-        abs_active_default for this frame AND the value of
-        signals.abs_active (STAGE 2: CanSignals now carries its own
-        abs_active field — this parameter is retained for callers that
-        want to override it, e.g. for testing, but sig.abs_active is
-        the primary source as of Stage 2).
+        abs_active_default for this frame AND signals.abs_active.
+        signals.abs_active is the primary source; this parameter is
+        retained for callers that want to override it, e.g. for testing.
 
-        STAGE 2 CHANGE: the previous hard branch for level==2 (which
-        returned static_roi verbatim and reset self.prev_roi to force
-        an un-smoothed jump on recovery) has been removed. Level 2 is
-        now just one point on a continuous confidence-driven blend
-        computed inside _compute_base_roi, so it flows through the
-        same expansion/smoothing/clamp path as every other level —
-        eliminating the single-frame jump documented as a known defect
-        in review_note.md Section 2.4/2.7.
+        Level 2 is one point on a continuous confidence-driven blend
+        computed inside _compute_base_roi, and flows through the same
+        expansion/smoothing/clamp path as every other level.
         """
         gates = self.conf_gates
         _validate_inputs(signals, static_roi, objects, self.prev_roi, gates)
 
-        self.frames_since_init += 1  # STAGE 8B (NEW): frame 1 = first ever call
+        self.frames_since_init += 1  # frame 1 = first ever call
 
         effective_abs_active = self.abs_active_default if abs_active is None else abs_active
 
@@ -3391,8 +2872,8 @@ class ROIGenerator:
             objects or [], use_external_ids=self.use_external_tracker
         )
 
-        # --- Base ROI (Stage 2: continuous confidence blending + Level 3) ---
-        frame_diagnostics = FloorClampDiagnostics()  # STAGE 8B: fresh each frame
+        # --- Base ROI (continuous confidence blending + Level 3) ---
+        frame_diagnostics = FloorClampDiagnostics()  # fresh each frame
         roi, level = _compute_base_roi(
             lane, signals, static_roi,
             camera=self.camera,
@@ -3401,38 +2882,32 @@ class ROIGenerator:
             diagnostics=frame_diagnostics,
             quantize_inputs=self.quantize_inputs,
         )
-        # STAGE 8B: frame_diagnostics is not populated on the quantized
-        # path (see _compute_base_roi's docstring) — reflect that
-        # honestly rather than exposing a diagnostics object that looks
-        # populated but was never actually filled in for this frame.
+        # frame_diagnostics is not populated on the quantized path
+        # (see _compute_base_roi's docstring) — reflect that honestly
+        # rather than exposing a diagnostics object that was never
+        # actually filled in for this frame.
         self.last_floor_diagnostics = (
             frame_diagnostics if (self.camera is not None and not self.quantize_inputs) else None
         )
-        speed_was_implausible_this_frame = roi.speed_was_implausible  # STAGE 8B (NEW):
-            # captured HERE, immediately, because both _smooth_asymmetric()
-            # and the final safety-clamp reconstruction below build a NEW
-            # ROIParameters from scratch and would otherwise silently drop
-            # this field (they already did not carry it forward — found
-            # and fixed during this same implementation session, 2026-08-11).
+        speed_was_implausible_this_frame = roi.speed_was_implausible  # captured
+            # immediately, because _smooth_asymmetric() and the final safety-
+            # clamp reconstruction build a NEW ROIParameters from scratch and
+            # would otherwise silently drop this field.
 
-        # STAGE 8: retained as the hard floor the area cap (below) can
-        # never intrude into — this is the SAME rectangle frozen_corridor
-        # is derived from, captured here under its own name for clarity
-        # at the point it is actually used.
+        # Retained as the hard floor the area cap (below) can never
+        # intrude into.
         base_roi_for_cap = roi
 
-        # STAGE 7: freeze the corridor ONCE here, before ANY expansion
-        # this frame, and share it across object expansion, occlusion
-        # response, and vertical peek — consistent with the Stage 3
-        # principle that re-deriving the corridor from a
-        # progressively-widening `roi` mid-frame would let one
-        # expansion wrongly make a later, unrelated check more
-        # permissive than it should be.
+        # Freeze the corridor ONCE here, before ANY expansion this frame,
+        # and share it across object expansion, occlusion response, and
+        # vertical peek — re-deriving the corridor from a progressively-
+        # widening `roi` mid-frame would let one expansion wrongly make a
+        # later, unrelated check more permissive than it should be.
         frozen_corridor = (roi.x_left, roi.x_left + roi.width)
 
-        # --- Object expansions (TTC-aware) — now applied uniformly at
-        # every level, including Level 3 (full-frame), where expansion
-        # is a no-op in practice since the frame is already maximal. ---
+        # --- Object expansions (TTC-aware) ---
+        # Applied at every level, including Level 3 (full-frame), where
+        # expansion is a no-op since the frame is already maximal.
         if tracked_objects:
             roi = _apply_object_expansions(
                 roi, tracked_objects, gates,
@@ -3441,7 +2916,7 @@ class ROIGenerator:
                 corridor_bounds=frozen_corridor,
             )
 
-        # --- STAGE 7: sign memory + occlusion response + vertical peek ---
+        # --- Sign memory + occlusion response + vertical peek ---
         _update_sign_memory(self.sign_memory, tracked_objects, gates)
         roi = _apply_occlusion_response(
             roi, tracked_objects, self.sign_memory, self.registry,
@@ -3452,7 +2927,7 @@ class ROIGenerator:
             frozen_corridor[0], frozen_corridor[1],
         )
 
-        # --- STAGE 8: cap total area, never intruding into the floor ---
+        # --- Cap total area, never intruding into the floor ---
         roi = _apply_area_cap(roi, base_roi_for_cap)
 
         # --- IIR smoothing ---
@@ -3466,9 +2941,9 @@ class ROIGenerator:
             width=_clamp(roi.width,  ROI_WIDTH_MIN,  ROI_WIDTH_MAX),
             height=_clamp(roi.height, ROI_HEIGHT_MIN, ROI_HEIGHT_MAX),
             roi_level=roi.roi_level,
-            frames_since_init=self.frames_since_init,  # STAGE 8B (NEW)
-            is_warmed_up=(self.frames_since_init >= WARMUP_FRAMES_REQUIRED),  # STAGE 8B (NEW)
-            speed_was_implausible=speed_was_implausible_this_frame,  # STAGE 8B (NEW)
+            frames_since_init=self.frames_since_init,
+            is_warmed_up=(self.frames_since_init >= WARMUP_FRAMES_REQUIRED),
+            speed_was_implausible=speed_was_implausible_this_frame,
         )
 
         self.prev_roi = roi
@@ -3493,8 +2968,7 @@ def generate_dynamic_roi(
     """
     Stateless functional interface.  Backward-compatible with v1.
 
-    STAGE 1 CHANGE: accepts an optional `camera` argument, same
-    semantics as ROIGenerator — see that class's docstring.
+    Accepts an optional `camera` argument — same semantics as ROIGenerator.
 
     Note: TTC and tracking require the stateful ROIGenerator class.
     When objects contain track_id (pre-assigned externally), basic
@@ -3507,8 +2981,8 @@ def generate_dynamic_roi(
     if camera is None:
         warnings.warn(
             "generate_dynamic_roi() called without camera intrinsics — "
-            "the invariant collision-coverage floor (Stage 1) will NOT "
-            "be applied. Pass camera=CameraIntrinsics(...) to enable it.",
+            "the invariant collision-coverage floor will NOT be applied. "
+            "Pass camera=CameraIntrinsics(...) to enable it.",
             UserWarning,
             stacklevel=2,
         )
@@ -3517,15 +2991,11 @@ def generate_dynamic_roi(
         lane, signals, static_roi,
         camera=camera, abs_active=abs_active, isa_enabled=isa_enabled,
     )
-    speed_was_implausible_this_call = roi.speed_was_implausible  # STAGE 8B (NEW):
-        # captured here for the same reason as in ROIGenerator.step() —
+    speed_was_implausible_this_call = roi.speed_was_implausible  # captured
+        # here for the same reason as in ROIGenerator.step() —
         # _apply_object_expansions/_smooth_asymmetric/the final clamp
         # below all build a new ROIParameters and would otherwise lose it.
 
-    # STAGE 2 CHANGE: the old hard level==2 branch (returning static_roi
-    # verbatim) has been removed — level 2 is now one point on the
-    # continuous confidence blend computed inside _compute_base_roi, and
-    # flows through the same expansion path as every other level.
 
     if objects:
         tracked = [o for o in objects if o.track_id is not None]
@@ -3550,7 +3020,7 @@ def generate_dynamic_roi(
         width=_clamp(roi.width,  ROI_WIDTH_MIN,  ROI_WIDTH_MAX),
         height=_clamp(roi.height, ROI_HEIGHT_MIN, ROI_HEIGHT_MAX),
         roi_level=roi.roi_level,
-        speed_was_implausible=speed_was_implausible_this_call,  # STAGE 8B (NEW)
+        speed_was_implausible=speed_was_implausible_this_call,
     )
 
     return roi
