@@ -183,9 +183,9 @@ cd apps_python
 python -m pytest roi/test_vectors.py -v
 ```
 
-- [ ] All 133 test vectors pass in original location
-- [ ] All 133 test vectors pass after module move
-- [ ] `validate_stage9.py` reports floor recall ≥ 95%
+- [x] All 133 test vectors pass in original location
+- [x] All 133 test vectors pass after module move (import via `apps_python/roi/`)
+- [x] `validate_stage9.py` reports floor recall ≥ 95% (134/141 = 95.0%)
 
 ---
 
@@ -201,10 +201,10 @@ Write a minimal script (`tests/test_roi_integration_smoke.py`) that:
 python tests/test_roi_integration_smoke.py
 ```
 
-- [ ] Script created
-- [ ] Runs without GStreamer
-- [ ] Floor containment asserted per frame
-- [ ] No exceptions over 50 frames
+- [x] Script created (`tests/test_roi_integration_smoke.py`)
+- [x] Runs without GStreamer
+- [x] Floor containment asserted per frame
+- [x] No exceptions over 50 frames
 
 ---
 
@@ -377,7 +377,7 @@ Collect the four citable metrics on real recorded drives:
 |-------|-------|--------|
 | Integration — module + config | 1 ✅, 2 ✅, 6 ✅ | ✅ Done |
 | Integration — pipeline wiring | 3 ✅, 4 ✅, 5 ✅ | ✅ Done |
-| Testing — unit + smoke | 7, 8 | ⬜ Not Started |
+| Testing — unit + smoke | 7 ✅, 8 ✅ | ✅ Done |
 | Testing — full pipeline + visual | 9, 10 | ⬜ Not Started |
 | Testing — fix hard-braking | 11 | ⬜ Not Started |
 | On-board — deploy + latency + FPS | 12, 13, 14 | ⬜ Not Started |
@@ -517,3 +517,68 @@ The static crop in the flow definition is set to the full frame. This value is o
 **What still needs updating before vehicle testing:**
 - `mounting_height_m: 1.5` — placeholder. Must be replaced with the actual camera mount height measured on the vehicle (tape measure from road surface to camera lens centre).
 - `can_mode: mock` → `can_mode: real` and update arbitration IDs from the vehicle DBC file (Step 16).
+
+---
+
+### Step 7: Unit Tests — ROI Module Standalone
+
+**What was run and why:**
+The test suite (`Adaptive_ROI/test_vectors.py`) contains 133 parameterised test cases covering every significant code path in `dynamic_roi.py` — floor geometry, confidence blending, curvature fusion, Kalman tracking lifecycle, TTC urgency zones, sign occlusion, and edge/invalid-input guards.
+
+Two passes were run:
+
+**Pass 1 — original location:**
+```
+cd Adaptive_ROI && python3 -m pytest test_vectors.py -v
+133 passed, 1 warning in 0.76s
+```
+The one warning is expected: a test that explicitly constructs `ROIGenerator(camera=None)` to verify the no-camera code path triggers the documented user warning.
+
+**Pass 2 — moved module (`apps_python/roi/`):**
+Instead of copying `test_vectors.py` into `apps_python/roi/` (which would duplicate the file and create a maintenance burden), the existing test file was run with `apps_python/` prepended to `sys.path`:
+```
+python3 -m pytest Adaptive_ROI/test_vectors.py --override-ini="pythonpath=apps_python" -q
+133 passed, 1 warning in 0.67s
+```
+This confirms the module is importable as `from roi.dynamic_roi import ...` from within the pipeline's working directory, which is exactly how `edge_ai_class.py` and `infer_pipe.py` import it at runtime.
+
+**`validate_stage9.py` results:**
+
+| Metric | Result | Target |
+|--------|--------|--------|
+| Floor coverage recall | 134/141 frames (95.0%) | ≥ 95% |
+| Object containment (in-corridor) | 53/53 (100%) | Adaptive ≥ static in-corridor |
+| Mean adaptive area | 37.0% of frame | < 60% |
+| Expected misses (outside corridor) | 9 frames | Correct behaviour |
+
+The `highway_hard_braking` scenario reports 3/10 (30%) floor recall — a known issue documented in Step 11. The aggregate passes the 95% threshold because the other 11 scenarios all hit 100%. This will be fixed in Step 11 before vehicle testing.
+
+---
+
+### Step 8: Integration Smoke Test — Mock CAN, No GStreamer
+
+**What was built:**
+`tests/test_roi_integration_smoke.py` — a standalone script that exercises the full ROI compute path without any GStreamer, camera, or display dependency. It imports directly from `apps_python/` so it tests the same code the pipeline will run.
+
+**What it does per frame:**
+1. Calls `CANSignalReader.get_latest()` to advance the CSV replay by one row
+2. Calls `ROIGenerator.step()` with `LaneInfo(confidence=0.0)` (no lane input) to stress the CAN-only fallback path
+3. Calls `_invariant_floor()` with the same speed and ABS state to compute the ground-truth floor bounds
+4. Asserts `roi ⊇ floor` within a 1e-6 tolerance (same check used in `validate_stage9.py`)
+5. Asserts all four ROI fields are in valid normalised range
+
+**ISA disabled** (`isa_enabled=False`) so the test is scoped to the core FCW floor + CAN-only centring path, without sign-detection logic that has no input to exercise here.
+
+**Results:**
+```
+Floor containment: 50/50 frames (100%)
+No exceptions over 50 frames.
+```
+
+All 50 frames at 55 km/h (the constant speed in `can_signals_indian_road1.csv`), ROI level L2 (CAN-only, no lane), area 41.5% of frame. The CSV is a flat-speed recording so all frames are identical — variation across speeds and steering inputs is covered by `test_vectors.py` and `validate_stage9.py`.
+
+**Run command:**
+```bash
+cd "ti-j722s-app-python 2"
+python3 tests/test_roi_integration_smoke.py
+```
