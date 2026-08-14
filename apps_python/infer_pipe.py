@@ -58,7 +58,7 @@ class InferPipe:
         self.fallback_roi  = ROIParameters(x_left=0.0, y_top=0.0, width=1.0, height=1.0)
         self._current_roi  = self.fallback_roi
         self._roi_lock     = threading.Lock()
-        self._latest_lane_info = None
+        self._latest_lane_info = LaneInfo(center_norm=None, width_norm=None, confidence=0.0)
         self._latest_objects   = []
         self._feedback_lock    = threading.Lock()
         self.gst_pre_inp = gst_pipe.get_src(sub_flow.gst_pre_src_name, sub_flow.flow.id)

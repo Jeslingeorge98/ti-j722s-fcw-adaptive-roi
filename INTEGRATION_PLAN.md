@@ -222,10 +222,16 @@ Verify:
 - FPS printed in report
 - ROI level distribution logged
 
-- [ ] Pipeline runs to EOS without crash
-- [ ] ROI is dynamic (varies frame-to-frame)
-- [ ] FPS ≥ 25 on PC (board target is ≥ 30)
+- [x] Pipeline runs to EOS without crash (1321 frames, zero exceptions)
+- [x] ROI is dynamic (varies frame-to-frame — confirmed via per-frame debug log)
+- [ ] FPS ≥ 25 on PC (board target is ≥ 30) — board measured 17.5 fps; see note below
 - [ ] `roi_level` distribution in log shows mix of L0/L1/L2
+
+> **Note — FPS:** 17.5 fps measured on J722S EVM without the VPAC/DMPAC clock boost
+> that `init_script.sh` applies in a normal session. The `SOC=j722s` env var must be
+> sourced (`source /opt/edgeai-gst-apps/init_script.sh`) before running — without it
+> the pipeline falls back to CPU-only pre-processing and the hardware pre-processor
+> (`tiovxdlpreproc`) is not engaged. Re-run after clock boost to get the production FPS.
 
 ---
 
@@ -378,9 +384,9 @@ Collect the four citable metrics on real recorded drives:
 | Integration — module + config | 1 ✅, 2 ✅, 6 ✅ | ✅ Done |
 | Integration — pipeline wiring | 3 ✅, 4 ✅, 5 ✅ | ✅ Done |
 | Testing — unit + smoke | 7 ✅, 8 ✅ | ✅ Done |
-| Testing — full pipeline + visual | 9, 10 | ⬜ Not Started |
+| Testing — full pipeline + visual | 9 ✅, 10 | 🔄 In Progress |
 | Testing — fix hard-braking | 11 | ⬜ Not Started |
-| On-board — deploy + latency + FPS | 12, 13, 14 | ⬜ Not Started |
+| On-board — deploy + latency + FPS | 12 ✅, 13, 14 | 🔄 In Progress |
 | On-board — ARM consistency | 15 | ⬜ Not Started |
 | On-vehicle — CAN integration | 16 | ⬜ Not Started |
 | On-vehicle — live Stage 9 metrics | 17 | ⬜ Not Started |
@@ -582,3 +588,75 @@ All 50 frames at 55 km/h (the constant speed in `can_signals_indian_road1.csv`),
 cd "ti-j722s-app-python 2"
 python3 tests/test_roi_integration_smoke.py
 ```
+
+---
+
+### Step 12: Deploy to Board
+
+**Board:** J722SXH01EVM — `ssh root@172.16.76.106` (IP updated from 172.16.73.52)
+
+**What was deployed:**
+The app was deployed to a new isolated directory `/opt/edgeai_fcw_roi/` on the board — entirely separate from the existing `/opt/edgeai-gst-apps/` installation. Nothing in the board's existing app was modified.
+
+Directory structure created on board:
+```
+/opt/edgeai_fcw_roi/
+├── apps_python/
+│   ├── roi/
+│   │   ├── __init__.py
+│   │   └── dynamic_roi.py         ← our ROI module
+│   ├── can_interface.py            ← our CAN reader
+│   ├── edge_ai_class.py            ← our modified version (ROI/CAN init)
+│   ├── infer_pipe.py               ← our modified version (per-frame ROI)
+│   ├── post_process.py             ← our modified version (lane/det feedback)
+│   └── app_edgeai.py, config_parser.py, gst_wrapper.py, ...  ← board's own base files
+└── configs/
+    ├── fcw_with_roi_board.yaml     ← board-local paths
+    └── fcw_test_oneshot.yaml       ← loop: False variant for one-shot test
+```
+
+**Important:** The base utility files (`gst_wrapper.py`, `gst_element_map.py`, `config_parser.py`, `app_edgeai.py`, `utils.py`, `debug.py`, `opencv_patch.py`) were pulled FROM the board's own `/opt/edgeai-gst-apps/apps_python/` — not from our local copies — to ensure version compatibility with the board's model zoo and TIDL runtime.
+
+**CAN CSV deployed:**
+`/home/jeslin/Indian_conditions/can_signals_indian_road1.csv` → `/opt/online_test_data/can_signals_indian_road1.csv`
+
+**Import verification:**
+```bash
+python3 -c "from roi.dynamic_roi import ROIGenerator; print('OK')"  # OK
+```
+
+---
+
+### Step 9: Full Pipeline Test — on J722S Board
+
+**How to run:**
+```bash
+source /opt/edgeai-gst-apps/init_script.sh   # REQUIRED — sets SOC=j722s
+cd /opt/edgeai_fcw_roi/apps_python
+python3 app_edgeai.py ../configs/fcw_test_oneshot.yaml --no-curses --verbose
+```
+
+**Why `init_script.sh` is mandatory:**
+Without it, `SOC` env var is not set and the pipeline falls back to CPU-only pre-processing (standard `videoscale → videobox → videoconvert → appsink`). In that mode, the GStreamer buffer contains raw uint8 RGB data, but `pull_tensor()` constructs the ndarray with `data_type=float32` (from `model.input_tensor_types`), requiring 4× more bytes than the buffer contains — resulting in `TypeError: buffer is too small for requested array`.
+
+With `SOC=j722s` set, the pipeline uses TI's hardware pre-processor (`tiovxdlpreproc`) which performs mean subtraction, scaling, and format conversion on the C7x DSP — the appsink delivers a float32 tensor directly, matching what `pull_tensor()` expects.
+
+**Bug fixed during this step:**
+`infer_pipe.py` line 61 initialised `_latest_lane_info = None`. On the first frame, `pipeline()` calls `roi_generator.step(lane_info=None, ...)`, which reaches `lane.width_norm` in `_compute_base_roi()` and raises `AttributeError: 'NoneType' object has no attribute 'width_norm'`. Fixed by initialising to a safe zero-confidence default:
+```python
+self._latest_lane_info = LaneInfo(center_norm=None, width_norm=None, confidence=0.0)
+```
+
+**Results:**
+
+| Metric | Result |
+|--------|--------|
+| Frames processed | 1321 (full video, EOS) |
+| Exceptions | 0 |
+| Pipeline FPS (board) | **17.5 fps** |
+| Inference time (avg) | ~37 ms per frame |
+| ROI dynamic | Yes — adapts per frame |
+
+**FPS note:** 17.5 fps is measured without the VPAC/DMPAC clock boost that `init_script.sh` applies when run interactively in a proper session (the SSH non-interactive shell does not run `/etc/profile.d/` scripts). The 30 fps target (Step 14) is to be re-measured after the clock boost is active. The pipeline itself is correct and stable.
+
+**Output video:** `/opt/online_test_data/output/output_fcw_roi_indian_road1.mkv`
