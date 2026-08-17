@@ -862,22 +862,34 @@ TI's `utils.py` has `print_stdout = False` by default — FPS is overlaid on the
 | ARM post-processing | **~38 ms** | — |
 | ROI compute (within ARM) | **~1.05 ms** | < 10 ms ✅ |
 
-**Why 13 fps instead of 30 fps:**
+**Why 13 fps instead of 17.5 fps (the pre-integration baseline):**
 
-The pipeline uses two concurrent stages (`pipeline()` and `post_pipeline()` threads). The bottleneck is whichever stage is slower. Both stages take approximately equal time (~37–38 ms each), giving a combined frame time of ~75 ms = 13 fps.
+The TI baseline demo (UFLDv2 + YOLOX overlay, without our ROI module) ran at **17.5 fps actual** (measured by `utils.py`, not `tiperfoverlay`). After integrating the Adaptive ROI module, FPS dropped to 13.28 fps — a real reduction of ~4.2 fps, corresponding to ~18 ms of added frame time.
 
-The ARM post-processing stage (`post_pipeline()`) does:
-1. `od_model.run_time()` — YOLOX-nano overlay detection, a synchronous TIDL call from the ARM thread that blocks until C7x_1 returns results (~35–40 ms at 416×416 input)
-2. OpenCV drawing ops — lane lines, detection boxes, ROI rectangle, text labels
-3. `gst_pipe.push_frame()` — frame handoff to GStreamer
+The ROI compute itself (1.05 ms) is **not** the bottleneck. The real cost comes from the two feedback-extractor functions added in `post_pipeline()` that run every frame to produce the inputs the ROI module needs on the next frame:
 
-The YOLOX overlay detection is the dominant ARM cost. This is a TI reference feature included in the baseline demo, not added by our ROI integration.
+- **`_extract_lane_info()`**: Re-runs `pred2coords()` (softmax over all row/col anchors, coordinate conversion), `filter_lane()` for each lane, `np.polyfit()` on the lane midline (least-squares polynomial), and sorting + interpolation. This duplicates work already done by `post_proc()` for drawing.
+- **`_extract_detections()`**: Re-runs `decode_detections()` (full NMS + bounding-box decode on the YOLOX output tensors) and class name resolution for each detection.
 
-**Why it is not 18 fps as observed before ROI integration:**
+Together these add an estimated **~17 ms** of ARM time per frame on the Cortex-A55, on top of the 1.05 ms ROI compute:
 
-The "18 fps" observed on the display was reported by `tiperfoverlay`, which counts frames reaching the mosaic element — it measures display throughput, not inference throughput. True inference FPS was always ~13 fps. The display counter can run faster if the mosaic has queued frames or if loop mode repeats frames.
+| Source of overhead | Time |
+|---|---|
+| `_extract_lane_info()` + `_extract_detections()` | ~17 ms |
+| ROI compute (`roi_generator.step()`) | ~1 ms |
+| ROI rectangle draw + text | ~0.3 ms |
+| **Total overhead vs. baseline** | **~18 ms** |
 
-The TI baseline demo (without our ROI module) achieves ~17.5 fps under the same conditions. Our integration adds ~1.05 ms of ARM compute per frame — at 13 fps that is 1.05 × 13 ≈ 13.7 ms per second, or ~1.4% of total CPU time. This is well within the "< 1 FPS overhead" budget.
+**Summary of the FPS budget:**
+
+| Milestone | Frame time | FPS |
+|---|---|---|
+| TI baseline (UFLDv2 + YOLOX, no ROI) | ~57 ms | **17.5 fps** |
+| With Adaptive ROI integration | ~75 ms | **13.28 fps** |
+| Overhead added by ROI module | **~18 ms** | **−4.2 fps** |
+
+**Optimisation path (future work):**
+The extractor functions duplicate tensor decoding already done by `post_proc()`. Refactoring `post_proc()` to return `(frame, lane_info, objects)` directly — instead of running a second decode pass — would recover most of the 17 ms and bring FPS back toward the 17.5 fps baseline. This is not required for Stage 9 validation but is noted for Stage 10 optimisation.
 
 **What is using each compute unit:**
 
@@ -890,7 +902,7 @@ The TI baseline demo (without our ROI module) achieves ~17.5 fps under the same 
 
 Both C7x DSPs run concurrently with the ARM thread — while C7x_2 runs UFLDv2 for frame N, C7x_1 is completing YOLOX for frame N-1 and the ARM is in post_pipeline. The two-stage threading design (`Queue(maxsize=2)`) keeps all three compute units busy simultaneously.
 
-**Conclusion:** The ROI module is **not** the FPS bottleneck. To reach 30 fps, the YOLOX overlay detection would need to be offloaded asynchronously or replaced with a lighter model. That is outside the scope of this integration.
+**Conclusion:** The ROI module's true cost per frame is ~18 ms (extractors + compute), not just the 1.05 ms compute alone. The primary optimisation target is eliminating the duplicate tensor decode in `_extract_lane_info()` and `_extract_detections()`. This is deferred to Stage 10.
 
 - [x] Measure end-to-end FPS on board
 - [x] Identify bottleneck (YOLOX overlay, not ROI)
