@@ -3089,6 +3089,24 @@ def canonical_bbox_to_fullframe(
 # Stability smoothing  (STAGE 4 IMPLEMENTED: asymmetric per-edge filter)
 # ==========================================================================
 
+def _union_with_floor(roi: ROIParameters, floor: ROIParameters) -> ROIParameters:
+    """Return the union of roi and floor edge by edge. Called after IIR
+    smoothing and the safety clamp to guarantee the invariant floor is
+    never violated — smoothing can hold edges inside the floor on the
+    first frame of a sudden event, and the height clamp (HOOD_Y_BOTTOM)
+    must not override the ABS-active floor that can legitimately reach 1.0."""
+    x_left  = min(roi.x_left,  floor.x_left)
+    y_top   = min(roi.y_top,   floor.y_top)
+    x_right = max(roi.x_left  + roi.width,  floor.x_left + floor.width)
+    y_bot   = max(roi.y_top   + roi.height, floor.y_top  + floor.height)
+    return replace(roi,
+        x_left=x_left,
+        y_top=y_top,
+        width=_clamp(x_right - x_left),
+        height=_clamp(y_bot  - y_top),
+    )
+
+
 ASYM_ALPHA_GROW_EDGE   = 0.30   # weight on PREVIOUS value when an edge is
                                   # GROWING (expanding outward) — low weight
                                   # on the past means the new, larger value
@@ -3470,6 +3488,10 @@ class ROIGenerator:
             is_warmed_up=(self.frames_since_init >= WARMUP_FRAMES_REQUIRED),  # STAGE 8B (NEW)
             speed_was_implausible=speed_was_implausible_this_frame,  # STAGE 8B (NEW)
         )
+
+        # Re-enforce floor after clamp: the height clamp (HOOD_Y_BOTTOM=0.97)
+        # must not override the ABS-active floor that can legitimately reach 1.0.
+        roi = _union_with_floor(roi, base_roi_for_cap)
 
         self.prev_roi = roi
         return roi
