@@ -18,12 +18,12 @@ roi_config:
 
 inputs:
   input0:
-    source: /opt/online_test_data/indian_road1_720p.mp4
+    source: /opt/online_test_data/test_mp4/indian_road1_720p.mp4
     format: mp4
     width: 1280
     height: 720
     framerate: 30
-    loop: True
+    loop: False
 
 models:
   model0:
@@ -36,9 +36,16 @@ models:
 
 outputs:
   output0:
+    sink: kmssink
+    width: 1920
+    height: 1080
+    overlay-perf-type: graph
+
+  output1:
     sink: /opt/online_test_data/output/output_fcw_roi_indian_road1.mkv
     width: 1280
     height: 720
 
 flows:
-  flow0: [input0, model0, output0, [0, 0, 1280, 720]]
+  flow0: [input0, model0, output0, [320, 176, 1280, 720]]
+  flow1: [input0, model0, output1]

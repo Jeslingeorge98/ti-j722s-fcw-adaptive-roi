@@ -202,6 +202,12 @@ class InferPipe:
                 if frame is None:
                     break
 
+                # Pass current ROI to post_proc so it can draw the rectangle
+                # on the sensor frame in the same pass as lanes and detections
+                if self.roi_generator is not None:
+                    with self._roi_lock:
+                        self.post_proc.current_roi = self._current_roi
+
                 out_frame = self.post_proc(frame, result)
 
                 # Feed previous-frame lane/detection results back for next ROI

@@ -249,8 +249,10 @@ Add a debug draw of the ROI rectangle onto the output frame. Visually confirm:
 | Level 3 (both fail) | Full frame |
 | Vehicle in corridor | ROI expands around vehicle |
 
-- [ ] ROI rectangle drawn on output frame
-- [ ] All 7 visual conditions verified by eye
+- [x] ROI rectangle drawn on output frame
+- [x] ROI label ("ROI L0 75%") visible on display
+- [x] Output saved to MKV and copied to host PC for review
+- [ ] All 7 visual conditions verified by eye (pending full video review)
 
 ---
 
@@ -384,7 +386,7 @@ Collect the four citable metrics on real recorded drives:
 | Integration — module + config | 1 ✅, 2 ✅, 6 ✅ | ✅ Done |
 | Integration — pipeline wiring | 3 ✅, 4 ✅, 5 ✅ | ✅ Done |
 | Testing — unit + smoke | 7 ✅, 8 ✅ | ✅ Done |
-| Testing — full pipeline + visual | 9 ✅, 10 | 🔄 In Progress |
+| Testing — full pipeline + visual | 9 ✅, 10 🔄 | 🔄 In Progress |
 | Testing — fix hard-braking | 11 | ⬜ Not Started |
 | On-board — deploy + latency + FPS | 12 ✅, 13, 14 | 🔄 In Progress |
 | On-board — ARM consistency | 15 | ⬜ Not Started |
@@ -393,8 +395,8 @@ Collect the four citable metrics on real recorded drives:
 
 ---
 
-**Last updated:** August 13, 2026  
-**Board:** J722SXH01EVM — SSH `root@172.16.73.52`  
+**Last updated:** August 17, 2026  
+**Board:** J722SXH01EVM — SSH `root@172.16.76.106`  
 **SAE Deadline:** September 15, 2026
 
 ---
@@ -660,3 +662,99 @@ self._latest_lane_info = LaneInfo(center_norm=None, width_norm=None, confidence=
 **FPS note:** 17.5 fps is measured without the VPAC/DMPAC clock boost that `init_script.sh` applies when run interactively in a proper session (the SSH non-interactive shell does not run `/etc/profile.d/` scripts). The 30 fps target (Step 14) is to be re-measured after the clock boost is active. The pipeline itself is correct and stable.
 
 **Output video:** `/opt/online_test_data/output/output_fcw_roi_indian_road1.mkv`
+
+---
+
+### Step 10: Visual ROI Overlay — Implementation and Debugging
+
+**Goal:** Draw the adaptive ROI rectangle on every output frame so the behaviour can be verified by eye. The rectangle should be colour-coded by danger level (L0 green → L3 red) and carry a label showing level and area percentage.
+
+---
+
+**Implementation — two-file change:**
+
+**`post_process.py` — `PostProcessLaneDetection`:**
+Added `self.current_roi = None` in `__init__()`. At the end of `__call__()`, after lane lines and detection boxes are already drawn, the ROI rectangle and label are drawn on top:
+
+```python
+if self.current_roi is not None:
+    roi = self.current_roi
+    h, w = img.shape[0], img.shape[1]
+    x1 = int(roi.x_left * w);          y1 = int(roi.y_top * h)
+    x2 = int((roi.x_left + roi.width) * w)
+    y2 = int((roi.y_top  + roi.height) * h)
+    colours = {0: (0,255,0), 1: (0,255,255), 2: (0,165,255), 3: (0,0,255)}
+    colour  = colours.get(roi.roi_level, (255,255,255))
+    cv2.rectangle(img, (x1, y1), (x2, y2), colour, 2)
+    cv2.putText(img, f"ROI L{roi.roi_level}  {roi.width*roi.height*100:.0f}%",
+                (x1+4, max(y1+20, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA)
+```
+
+**`infer_pipe.py` — `post_pipeline()`:**
+Before calling `post_proc(frame, result)`, the current ROI is injected into the post-processor object under the ROI lock:
+
+```python
+if self.roi_generator is not None:
+    with self._roi_lock:
+        self.post_proc.current_roi = self._current_roi
+out_frame = self.post_proc(frame, result)
+```
+
+**Why draw inside `post_process.py` and not in `infer_pipe.py`:**
+An earlier attempt drew `cv2.rectangle` directly in `infer_pipe.py` after `post_proc()` returned. This caused "grains with colours" corruption on the display — the frame buffer's memory lifecycle inside GStreamer makes it unsafe to write to after `post_proc()` returns. Drawing inside `__call__()`, in the same pass as lane lines and detection boxes, uses the same safe memory lifecycle as all other cv2 operations in that function.
+
+---
+
+**Debugging — scan lines on display (initial kmssink output):**
+
+When the pipeline was first tested with `kmssink` output, the live display showed heavy horizontal scan lines (comb-like pattern) across the entire video frame. The ROI box and lane lines were clean — the corruption was in the underlying video pixels only.
+
+**Root cause:** The video source path in our config pointed to `/opt/online_test_data/indian_road1_720p.mp4`. The correct file used by TI's reference demo is in a subdirectory: `/opt/online_test_data/test_mp4/indian_road1_720p.mp4`. The two files have different MD5 checksums — the root-level copy is a different encode with a 1282-pixel coded width vs 1280 in the config. The 2-pixel per-row stride mismatch caused GStreamer's buffer padding to misalign with numpy's `width × 3` stride assumption, producing the horizontal banding.
+
+Confirmed by running `ffprobe` on both files:
+```
+/opt/online_test_data/indian_road1_720p.mp4     → coded_width=1282  (wrong)
+/opt/online_test_data/test_mp4/indian_road1_720p.mp4 → coded_width=1280  (correct)
+```
+
+**Fix:** Updated `configs/fcw_with_roi_board.yaml` to use the `test_mp4/` path.
+
+---
+
+**DSP resource leak — stuck C7x_2:**
+
+During debugging, the pipeline was killed mid-run with `kill -9`. The TI cleanup handler (`signal 15` / SIGTERM path) logs "Application did not close some rpmsg_char devices". After a hard kill, the C7x_2 DSP core remains locked and the next run fails with:
+```
+IPC: ERROR: Unable to create TX channels for CPU [c7x_2] !!!
+TIDL_RT_OVX: ERROR: Verifying TIDL graph ... Failed !!!
+```
+
+**Fix:** Full board reboot (`reboot`) clears the DSP firmware state. Always let the pipeline reach EOS or send SIGTERM (not SIGKILL) to allow the cleanup handler to run.
+
+---
+
+**Final run — file output mode:**
+
+Rather than verifying on the live kmssink display, the config was switched to file-only output to produce a clean MKV for frame-by-frame review:
+
+```yaml
+outputs:
+  output0:
+    sink: /opt/online_test_data/output/output_fcw_roi_indian_road1.mkv
+    width: 1280
+    height: 720
+flows:
+  flow0: [input0, model0, output0]
+```
+
+The pipeline ran to EOS cleanly (74-second video, ~86 seconds wall-clock including 12s model load) with no errors. Output copied to host PC:
+
+```
+/home/jeslin/Adaptive_ROI/output_fcw_roi_indian_road1.mkv   (39 MB)
+```
+
+**Confirmed working:**
+- ROI rectangle visible in cyan (L0 — no danger, full fallback ROI at ~75% frame area)
+- Label "ROI L0 75%" rendered at top-left of the ROI box
+- Lane lines (green/blue) and vehicle detection boxes rendered correctly
+- Clean frame content — no scan lines with the correct source video

@@ -2113,6 +2113,7 @@ class PostProcessLaneDetection(PostProcess):
 
     def __init__(self, flow):
         super().__init__(flow)
+        self.current_roi = None  # set by InferPipe before each __call__
 
         # ModelConfig (edgeai_dl_inferer) only promotes a fixed, hardcoded set
         # of postprocess/preprocess keys to attributes and knows nothing about
@@ -2270,6 +2271,22 @@ class PostProcessLaneDetection(PostProcess):
         # Boxes go on top of the lane lines
         if self.od_model is not None:
             img = self._draw_detections(img)
+
+        # ROI rectangle on top of everything
+        if self.current_roi is not None:
+            roi = self.current_roi
+            h, w = img.shape[0], img.shape[1]
+            x1 = int(roi.x_left * w)
+            y1 = int(roi.y_top  * h)
+            x2 = int((roi.x_left + roi.width)  * w)
+            y2 = int((roi.y_top  + roi.height) * h)
+            colours = {0: (0,255,0), 1: (0,255,255), 2: (0,165,255), 3: (0,0,255)}
+            colour  = colours.get(roi.roi_level, (255,255,255))
+            cv2.rectangle(img, (x1, y1), (x2, y2), colour, 2)
+            cv2.putText(img,
+                f"ROI L{roi.roi_level}  {roi.width*roi.height*100:.0f}%",
+                (x1 + 4, max(y1 + 20, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2, cv2.LINE_AA)
 
         if self.debug:
             self.debug.log(self.debug_str)
