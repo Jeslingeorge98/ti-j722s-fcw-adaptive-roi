@@ -82,6 +82,7 @@ class InferPipe:
             if sub_flow.debug_config.inference:
                 self.infer_debug = debug.Debug(sub_flow.debug_config, "infer")
 
+        self._roi_latency_ms = []
         self.pipeline_thread = threading.Thread(target=self.pipeline)
         # Post-processing runs in its own thread so the ARM work for frame N-1
         # overlaps the C7x inference for frame N. Depth 2 bounds the added
@@ -102,6 +103,14 @@ class InferPipe:
         Stop the pipeline
         """
         self.stop_thread = True
+        if self._roi_latency_ms:
+            lats = self._roi_latency_ms
+            print(
+                f"[ROI latency] n={len(lats)} frames | "
+                f"mean={sum(lats)/len(lats):.3f} ms | "
+                f"max={max(lats):.3f} ms | "
+                f"p99={sorted(lats)[int(len(lats)*0.99)]:.3f} ms"
+            )
 
     def pipeline(self):
         """
@@ -117,16 +126,20 @@ class InferPipe:
                 if self.roi_generator is not None and self.can_reader is not None:
                     can_sig   = self.can_reader.get_latest()
                     lane_info = self._get_latest_lane_info()
+                    _t0 = time()
                     roi = self.roi_generator.step(
                         lane_info, can_sig, self.fallback_roi,
                         objects=self._get_latest_objects(),
                     )
+                    _roi_ms = (time() - _t0) * 1000.0
+                    self._roi_latency_ms.append(_roi_ms)
                     with self._roi_lock:
                         self._current_roi = roi
                     if self.sub_flow.debug_config:
                         print(
                             f"ROI L{roi.roi_level} | "
                             f"area={roi.width * roi.height:.4f} | "
+                            f"roi_ms={_roi_ms:.3f} | "
                             f"warmed={roi.is_warmed_up} | "
                             f"implausible_spd={roi.speed_was_implausible}"
                         )

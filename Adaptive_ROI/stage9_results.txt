@@ -1,9 +1,9 @@
 Stage 9 Validation Results
 Total frames: 141
-Floor coverage recall: 95.0%
+Floor coverage recall: 100.0%
 Adaptive object recall: 85.5%
 Static crop recall: 100.0%
 Recall gain: +-14.5 pp
-Mean adaptive area: 37.0%
+Mean adaptive area: 37.4%
 Static crop area: 60.0%
-Mean area reduction: 38.3%
+Mean area reduction: 37.6%
