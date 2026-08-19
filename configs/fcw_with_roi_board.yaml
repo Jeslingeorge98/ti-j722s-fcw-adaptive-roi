@@ -2,26 +2,27 @@ title: "FCW with Adaptive ROI — J722SXH01EVM"
 
 log_level: 2
 
-# Camera intrinsics from camera_calibration_c270.json (1280x720 calibration)
-# focal_length_px: mean(fx_px=1406.72, fy_px=1408.83)
+# Camera intrinsics scaled from camera_calibration_c270.json (1280x720 baseline)
+# to 1918x1136 source: focal scaled by mean(1918/1280, 1136/720)=1.538,
+# principal point scaled per axis. Recalibrate when calibration data is available.
 roi_config:
   camera:
-    focal_length_px: 1407.8
-    principal_point_x_px: 636.0
-    principal_point_y_px: 350.4
-    image_width_px: 1280
-    image_height_px: 720
+    focal_length_px: 2165.2
+    principal_point_x_px: 953.0
+    principal_point_y_px: 553.0
+    image_width_px: 1918
+    image_height_px: 1136
     mounting_height_m: 1.5       # update with tape measure on actual vehicle
   isa_enabled: true
   can_mode: mock
-  can_csv: /opt/online_test_data/can_signals_indian_road1.csv
+  can_csv: /opt/online_test_data/can_signals_indian_road_curve_30fps.csv
 
 inputs:
   input0:
-    source: /opt/online_test_data/test_mp4/indian_road1_720p.mp4
+    source: /opt/online_test_data/indian_road_curve_30fps.mp4
     format: mp4
-    width: 1280
-    height: 720
+    width: 1918
+    height: 1136
     framerate: 30
     loop: False
 
@@ -36,16 +37,9 @@ models:
 
 outputs:
   output0:
-    sink: kmssink
-    width: 1920
-    height: 1080
-    overlay-perf-type: graph
-
-  output1:
-    sink: /opt/online_test_data/output/output_fcw_roi_indian_road1.mkv
+    sink: /opt/online_test_data/output/output_fcw_roi_curve.mkv
     width: 1280
     height: 720
 
 flows:
-  flow0: [input0, model0, output0, [320, 176, 1280, 720]]
-  flow1: [input0, model0, output1]
+  flow0: [input0, model0, output0]

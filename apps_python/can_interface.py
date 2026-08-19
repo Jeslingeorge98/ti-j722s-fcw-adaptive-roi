@@ -26,6 +26,7 @@ import csv
 import math
 import struct
 import threading
+import time
 from typing import List, Optional
 
 from roi.dynamic_roi import CanSignals
@@ -41,6 +42,12 @@ _AID_ABS_ESC = 0x400
 _SPEED_SCALE = 0.01   # raw uint16 → km/h
 _STEER_SCALE = 0.1    # raw int16  → degrees
 _YAW_SCALE   = 0.01   # raw int16  → rad/s (converted to dps after)
+
+# Real mode: if no CAN message has been received within this window,
+# steering_valid and yaw_rate_valid are forced False so the ROI stops
+# using stale curvature estimates. abs_active/esc_active are kept at
+# their last value (conservative: ABS floor stays expanded if it was on).
+_STALE_TIMEOUT_S = 0.5
 
 _STOPPED = CanSignals(
     speed_mps=0.0,
@@ -83,6 +90,7 @@ class CANSignalReader:
         elif mode == 'real':
             import can  # python-can; lazy import keeps mock installs clean
             self._latest = _STOPPED
+            self._last_rx_time: float = 0.0  # monotonic timestamp of last received message
             self._lock = threading.Lock()
             self._bus = can.interface.Bus(channel=channel, bustype='socketcan')
             self._thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -96,14 +104,25 @@ class CANSignalReader:
     # ------------------------------------------------------------------
 
     def get_latest(self) -> CanSignals:
-        """Return current CanSignals. Thread-safe. Advances replay index in mock mode."""
+        """Return current CanSignals. Thread-safe. Advances replay index in mock mode.
+
+        Real mode: if no message has arrived within _STALE_TIMEOUT_S, returns
+        the last signals with steering_valid=False and yaw_rate_valid=False so
+        the ROI stops using stale curvature estimates. abs_active/esc_active
+        are kept at their last value (conservative: ABS floor stays expanded).
+        """
         if self._mode == 'mock':
             with self._lock:
                 sig = self._frames[self._idx]
                 self._idx = (self._idx + 1) % len(self._frames)
             return sig
         with self._lock:
-            return self._latest
+            sig = self._latest
+            age = time.monotonic() - self._last_rx_time
+        if age > _STALE_TIMEOUT_S:
+            from dataclasses import replace
+            sig = replace(sig, steering_valid=False, yaw_rate_valid=False)
+        return sig
 
     def close(self) -> None:
         """Shut down the CAN bus (real mode only). No-op in mock mode."""
@@ -163,6 +182,7 @@ class CANSignalReader:
                         abs_active=abs_active,
                         esc_active=esc_active,
                     )
+                    self._last_rx_time = time.monotonic()
 
             except Exception:
                 pass  # bus errors (cable pulled, etc.) — keep thread alive

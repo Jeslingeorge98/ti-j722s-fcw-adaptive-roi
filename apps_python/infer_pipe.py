@@ -253,26 +253,30 @@ class InferPipe:
 
 def _extract_lane_info(result, post_proc, img_h, img_w):
     """
-    Decode UFLDv2 inference output into LaneInfo for the next frame's ROI.
+    Build LaneInfo for the next frame's ROI from the lane dict cached by
+    PostProcessLaneDetection.__call__() during the draw pass. Falls back to a
+    full pred2coords decode on the first frame (before the cache is populated).
     Returns None if post_proc is not a lane detector or decoding fails.
     """
     from post_process import PostProcessLaneDetection, pred2coords, filter_lane
     if not isinstance(post_proc, PostProcessLaneDetection):
         return None
     try:
-        loc_row, loc_col, exist_row, exist_col = (np.squeeze(r) for r in result[:4])
+        lane_dict = getattr(post_proc, '_cached_lane_dict', None)
+        if lane_dict is None:
+            # First frame: cache not yet populated, do a full decode.
+            loc_row, loc_col, exist_row, exist_col = (np.squeeze(r) for r in result[:4])
+            lanes = pred2coords(
+                loc_row, loc_col, exist_row, exist_col,
+                post_proc.row_anchor, post_proc.col_anchor,
+                row_lane_idx=post_proc.row_lane_idx,
+                col_lane_idx=post_proc.col_lane_idx,
+                local_width=post_proc.local_width,
+                original_image_width=img_w,
+                original_image_height=img_h,
+            )
+            lane_dict = {lid: filter_lane(pts, img_h, img_w) for lid, pts in lanes}
 
-        lanes = pred2coords(
-            loc_row, loc_col, exist_row, exist_col,
-            post_proc.row_anchor, post_proc.col_anchor,
-            row_lane_idx=post_proc.row_lane_idx,
-            col_lane_idx=post_proc.col_lane_idx,
-            local_width=post_proc.local_width,
-            original_image_width=img_w,
-            original_image_height=img_h,
-        )
-
-        lane_dict = {lid: filter_lane(pts, img_h, img_w) for lid, pts in lanes}
         ego_left_id  = post_proc.row_lane_idx[0] if len(post_proc.row_lane_idx) > 0 else 1
         ego_right_id = post_proc.row_lane_idx[1] if len(post_proc.row_lane_idx) > 1 else 2
         left_pts  = lane_dict.get(ego_left_id,  [])
@@ -343,20 +347,37 @@ _SIGN_ROAD_NAMES  = {'stop sign'}
 
 def _extract_detections(result, post_proc):
     """
-    Decode detection inference output into List[DetectedObject] for ROI expansion.
-    Returns [] if post_proc is not a detection post-processor or decoding fails.
+    Build List[DetectedObject] for ROI expansion.
+
+    For a primary-detector pipeline (PostProcessDetection): decodes the main
+    model's output tensors.
+    For a lane-detection pipeline (PostProcessLaneDetection): reads the YOLOX
+    overlay bbox results already decoded by _draw_detections() — no second
+    inference call or tensor decode needed.
+    Returns [] if no usable detection results are available.
     """
-    from post_process import PostProcessDetection, decode_detections, resolve_class
-    if not isinstance(post_proc, PostProcessDetection):
+    from post_process import PostProcessDetection, PostProcessLaneDetection, \
+        decode_detections, resolve_class
+
+    if isinstance(post_proc, PostProcessDetection):
+        try:
+            bbox  = decode_detections(result, post_proc.model)
+            model = post_proc.model
+        except Exception:
+            return []
+    elif isinstance(post_proc, PostProcessLaneDetection) and post_proc.od_model is not None:
+        bbox  = getattr(post_proc, '_cached_od_bbox', [])
+        model = post_proc.od_model
+    else:
         return []
+
     try:
-        bbox = decode_detections(result, post_proc.model)
         objects = []
         for b in bbox:
             score = float(b[5])
-            if score < post_proc.model.viz_threshold:
+            if score < model.viz_threshold:
                 continue
-            class_name, _ = resolve_class(post_proc.model, int(b[4]))
+            class_name, _ = resolve_class(model, int(b[4]))
             name = class_name.split('/')[-1].lower().strip()
             if name in _VEHICLE_NAMES:
                 category = ObjectCategory.VEHICLE

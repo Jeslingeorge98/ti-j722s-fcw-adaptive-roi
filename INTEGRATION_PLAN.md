@@ -386,16 +386,19 @@ Collect the four citable metrics on real recorded drives:
 | Integration — module + config | 1 ✅, 2 ✅, 6 ✅ | ✅ Done |
 | Integration — pipeline wiring | 3 ✅, 4 ✅, 5 ✅ | ✅ Done |
 | Testing — unit + smoke | 7 ✅, 8 ✅ | ✅ Done |
-| Testing — full pipeline + visual | 9 ✅, 10 🔄 | 🔄 In Progress |
+| Testing — full pipeline + visual | 9 ✅, 10 ✅ | ✅ Done |
 | Testing — fix hard-braking | 11 ✅ | ✅ Done |
-| On-board — deploy + latency + FPS | 12 ✅, 13 ✅, 14 | 🔄 In Progress |
+| On-board — deploy + latency + FPS | 12 ✅, 13 ✅, 14 ✅ | ✅ Done |
+| Code review fixes | R6 ✅, R8 ✅, R9 ✅ | ✅ Done |
+| FPS optimisation (partial) | Cache decode ✅ | 🔄 13.5 fps — below 16 fps target |
+| Wire ROI to videobox | R1 | ⬜ Not Started |
 | On-board — ARM consistency | 15 | ⬜ Not Started |
 | On-vehicle — CAN integration | 16 | ⬜ Not Started |
 | On-vehicle — live Stage 9 metrics | 17 | ⬜ Not Started |
 
 ---
 
-**Last updated:** August 17, 2026 (Steps 11, 13 complete)  
+**Last updated:** August 19, 2026 (Review fixes R6, R8, R9 complete; FPS optimisation partial)  
 **Board:** J722SXH01EVM — SSH `root@172.16.76.106`  
 **SAE Deadline:** September 15, 2026
 
@@ -908,3 +911,123 @@ Both C7x DSPs run concurrently with the ARM thread — while C7x_2 runs UFLDv2 f
 - [x] Identify bottleneck (YOLOX overlay, not ROI)
 - [x] Confirm ROI overhead < 1 FPS budget
 - [x] Document compute unit assignment per operation
+
+---
+
+### FPS Optimisation Attempt — Eliminate Duplicate Tensor Decode
+
+**Problem identified:**
+`_extract_lane_info()` and `_extract_detections()` in `infer_pipe.py` ran a full second decode of the inference tensors every frame — `pred2coords()` + `filter_lane()` — even though `PostProcessLaneDetection.__call__()` had already decoded the same tensors for drawing. This added ~17 ms of ARM time per frame, reducing FPS from the 17.5 fps baseline to 13.28 fps.
+
+Additionally, `_extract_detections()` always returned `[]` for the lane detection pipeline (wrong `isinstance` check against `PostProcessDetection`), meaning ROI object expansion had zero vehicle input from the YOLOX overlay detections.
+
+**Changes made:**
+
+`apps_python/post_process.py`:
+- `PostProcessLaneDetection.__init__()`: added `self._cached_lane_dict = None` and `self._cached_od_bbox = []`
+- `PostProcessLaneDetection.__call__()`: building `lane_dict` during the drawing loop and caching as `self._cached_lane_dict` — no extra `filter_lane` calls
+- `PostProcessLaneDetection._draw_detections()`: caches decoded YOLOX bbox rows as `self._cached_od_bbox`
+
+`apps_python/infer_pipe.py`:
+- `_extract_lane_info()`: reads `_cached_lane_dict` instead of re-running `pred2coords` + `filter_lane`; falls back to full decode only on the first frame
+- `_extract_detections()`: added branch for `PostProcessLaneDetection` — reads `_cached_od_bbox` from the overlay detector, fixing the silent bug where ROI object expansion received no vehicle data
+
+**Result on board (curve video, 1918×1136 source):**
+
+| Metric | Before | After |
+|---|---|---|
+| FPS | 13.28 fps | 13.47 fps |
+| Avg dl-inference | 37.35 ms | 43.24 ms* |
+| ROI latency mean | 1.05 ms | 5.39 ms* |
+
+*Higher on curve video due to larger source resolution (1918×1136 vs 1280×720) and more detected objects on the curve road triggering more Kalman tracker updates.
+
+**Why FPS gain was small:**
+The TIDL calls for UFLDv2 (C7x_2, ~37 ms) and YOLOX (C7x_1, ~37 ms) appear to serialize rather than run in parallel, giving a combined ~74 ms per frame regardless of ARM savings. Reducing ARM stage 2 time does not change the DSP serialization bottleneck. The duplicate decode saving (~17 ms ARM) is absorbed into the DSP wait time and does not improve throughput.
+
+**FPS remains below 16 fps target.** Further FPS improvement requires either running the two DSPs truly in parallel, skipping YOLOX on alternate frames, or wiring the ROI to `videobox` to reduce the tensor size.
+
+---
+
+### New Test Video — Indian Road Curve
+
+A second test video was added for validation on a curved road scenario.
+
+**Problem with original file:**
+`indian_road_curve_compressed.mp4` was encoded at **1000 fps** (178,253 frames for 178 seconds of content). At 13.5 fps board throughput, processing would have taken ~3.7 hours. Root cause: VFR encoding wrote a timestamp at every millisecond, creating a frame for each.
+
+**Fix:** Re-encoded at 30 fps using ffmpeg `fps=30` filter:
+```bash
+ffmpeg -i indian_road_curve_compressed.mp4 -vf fps=30 -c:v libx264 -preset fast -crf 23 indian_road_curve_30fps.mp4
+```
+
+CAN signal CSV downsampled from 178,253 rows to 5,348 rows using uniform index mapping (every ~33rd row) to match the 30 fps frame count.
+
+**Files on board:**
+```
+/opt/online_test_data/indian_road_curve_30fps.mp4          (5348 frames, 30 fps, 1918×1136)
+/opt/online_test_data/can_signals_indian_road_curve_30fps.csv  (5348 rows)
+```
+
+**Files on host:**
+```
+/home/jeslin/Indian_conditions/indian_road_curve_30fps.mp4
+/home/jeslin/Indian_conditions/can_signals_indian_road_curve_30fps.csv
+```
+
+Config for this video: `configs/fcw_with_roi_board.yaml` (camera intrinsics scaled from 1280×720 calibration to 1918×1136).
+
+**Note on camera intrinsics:** The 1918×1136 config uses scaled intrinsics (focal: 2165.2 px, pp: [953, 553]) derived from the 1280×720 calibration. These should be recalibrated when proper calibration data is available for this camera/resolution.
+
+---
+
+### Code Review Fixes (August 2026)
+
+A structured review identified 11 limitations. The following were addressed in code:
+
+---
+
+**Fix R6 — Camera height inconsistent (post_process.py)**
+
+`post_process.py:1403` had `self.camera_height_m = 1.2` hardcoded in the distance estimator while `configs/fcw_with_roi_board.yaml` set `mounting_height_m: 1.5`. The same physical camera was described by two different heights — distance estimates and floor geometry disagreed by 0.3 m.
+
+**Fix:** Changed `post_process.py:1403` to `self.camera_height_m = 1.5`.
+
+---
+
+**Fix R9 — Floor silently absent without camera intrinsics**
+
+Three code paths accepted `camera=None` without raising an error:
+1. `_compute_base_roi()` — silently returned a placeholder ROI with no floor
+2. `ROIGenerator.__init__()` — issued `warnings.warn()` and continued
+3. `generate_dynamic_roi()` — issued `warnings.warn()` and continued
+
+All three now raise `ValueError` immediately. Applied to both `apps_python/roi/dynamic_roi.py` and `Adaptive_ROI/dynamic_roi.py`.
+
+**Validated:** `validate_stage9.py` still passes 141/141 (all callers pass valid camera intrinsics).
+
+---
+
+**Fix R8 — No staleness detection on CAN signals (real mode)**
+
+In real mode, `get_latest()` returned the last decoded value indefinitely after a bus fault, with `steering_valid=True` and `yaw_rate_valid=True` still set. Stale curvature estimates would silently drive the ROI.
+
+**Fix in `apps_python/can_interface.py`:**
+- Added `_STALE_TIMEOUT_S = 0.5` constant
+- `_reader_loop` records `self._last_rx_time = time.monotonic()` on every successful message
+- `get_latest()` in real mode checks age: if `time.monotonic() - self._last_rx_time > 0.5 s`, returns the last signals with `steering_valid=False` and `yaw_rate_valid=False`
+- `abs_active` and `esc_active` are kept at their last value (conservative: ABS floor stays expanded if it was active)
+
+**Why only steering/yaw expire:** A stale `steering_valid=True` causes the ROI to steer toward a wrong curvature — a safety risk. A stale `abs_active=True` keeps the floor expanded — conservative and safe.
+
+---
+
+**Review points deferred:**
+
+| Point | Decision |
+|---|---|
+| R7 — c2_confidence cap at 0.4 | Kept. Removing requires validation of vision curvature against GPS/IMU ground truth. |
+| R1 — Wire ROI to videobox | Next major milestone — requires R4 (latching loop) fix first |
+| R4 — Latching loop | Dormant until R1. Fix: run sign/signal detection on full frame |
+| R11 — Min ROI size guard | Dormant until R1. Guard: ROI must be ≥ model input size (640×256 px) |
+| R2, R3, R5, R10 | Design/known gaps — not code fixes |

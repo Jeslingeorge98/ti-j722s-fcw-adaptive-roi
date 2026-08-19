@@ -1400,7 +1400,7 @@ class PostProcessDetection(PostProcess):
         print(f"Loaded camera parameters: fx={self.fx:.2f}, fy={self.fy:.2f}")
 
         # Mount parameters
-        self.camera_height_m = 1.2
+        self.camera_height_m = 1.5
         self.camera_pitch_deg = 6.0
         self.pitch_rad = float(np.deg2rad(self.camera_pitch_deg))
 
@@ -2113,7 +2113,9 @@ class PostProcessLaneDetection(PostProcess):
 
     def __init__(self, flow):
         super().__init__(flow)
-        self.current_roi = None  # set by InferPipe before each __call__
+        self.current_roi = None      # set by InferPipe before each __call__
+        self._cached_lane_dict = None  # {lane_id: filtered_pts}, populated each __call__
+        self._cached_od_bbox   = []    # raw bbox rows from last _draw_detections
 
         # ModelConfig (edgeai_dl_inferer) only promotes a fixed, hardcoded set
         # of postprocess/preprocess keys to attributes and knows nothing about
@@ -2195,6 +2197,7 @@ class PostProcessLaneDetection(PostProcess):
         )
 
         bbox = decode_detections(self.od_model.run_time(tensor), self.od_model)
+        self._cached_od_bbox = bbox  # expose to _extract_detections without re-running inference
 
         h, w = img.shape[0], img.shape[1]
         font = cv2.FONT_HERSHEY_SIMPLEX
@@ -2252,8 +2255,10 @@ class PostProcessLaneDetection(PostProcess):
             original_image_width=img_w, original_image_height=img_h,
         )
 
+        lane_dict = {}
         for lane_id, points in lanes:
             lane = filter_lane(points, img_h, img_w)
+            lane_dict[lane_id] = lane  # cache all lanes (including short ones) for ROI feedback
             if len(lane) < 2:
                 continue
 
@@ -2267,6 +2272,8 @@ class PostProcessLaneDetection(PostProcess):
 
             if self.debug:
                 self.debug_str += "%s: %s\n" % (lane_name, lane)
+
+        self._cached_lane_dict = lane_dict
 
         # Boxes go on top of the lane lines
         if self.od_model is not None:

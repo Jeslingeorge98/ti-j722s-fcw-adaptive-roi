@@ -2428,13 +2428,11 @@ def _compute_base_roi(
         level = 1
 
     if camera is None:
-        # No camera intrinsics: fall back to lateral-only positioning
-        # with a conservative vertical placeholder — temporary
-        # compatibility path, not a supported long-term mode (see
-        # Stage 1 notes; unchanged in Stage 2).
-        lane_based_roi = _roi_from_center(cx, half_w, y_top=0.05, height=0.90, level=level)
-        lane_based_roi = replace(lane_based_roi, speed_was_implausible=speed_was_implausible)
-        return lane_based_roi, level
+        raise ValueError(
+            "_compute_base_roi() called without camera intrinsics. "
+            "The invariant collision-coverage floor cannot be computed. "
+            "Pass a CameraIntrinsics instance."
+        )
 
     _validate_camera_intrinsics(camera)
 
@@ -3282,14 +3280,10 @@ class ROIGenerator:
         if camera is not None:
             _validate_camera_intrinsics(camera)
         else:
-            warnings.warn(
-                "ROIGenerator constructed without camera intrinsics — "
-                "the invariant collision-coverage floor (Stage 1) will "
-                "NOT be applied, and the physics-based safety guarantee "
-                "this module is designed to provide will not hold. "
-                "Pass camera=CameraIntrinsics(...) to enable it.",
-                UserWarning,
-                stacklevel=2,
+            raise ValueError(
+                "ROIGenerator requires camera intrinsics — "
+                "the invariant collision-coverage floor cannot be computed without them. "
+                "Pass camera=CameraIntrinsics(...) to the constructor."
             )
 
     def reset_for_warm_restart(self) -> None:
@@ -3527,12 +3521,10 @@ def generate_dynamic_roi(
     _validate_inputs(signals, static_roi, objects, prev_roi, gates)
 
     if camera is None:
-        warnings.warn(
-            "generate_dynamic_roi() called without camera intrinsics — "
-            "the invariant collision-coverage floor (Stage 1) will NOT "
-            "be applied. Pass camera=CameraIntrinsics(...) to enable it.",
-            UserWarning,
-            stacklevel=2,
+        raise ValueError(
+            "generate_dynamic_roi() requires camera intrinsics — "
+            "the invariant collision-coverage floor cannot be computed without them. "
+            "Pass camera=CameraIntrinsics(...) to enable it."
         )
 
     roi, level = _compute_base_roi(
