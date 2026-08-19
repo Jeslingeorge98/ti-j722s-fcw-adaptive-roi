@@ -3248,6 +3248,8 @@ class ROIGenerator:
         abs_active_default:   bool  = False,
         isa_enabled:          bool  = False,
         quantize_inputs:      bool  = False,
+        min_width_norm:       float = 0.0,
+        min_height_norm:      float = 0.0,
     ):
         self.camera                = camera
         self.conf_gates            = conf_gates or ConfidenceGates()
@@ -3276,6 +3278,8 @@ class ROIGenerator:
             # frames_since_init=1, not 0 — see step() for exactly where
             # this increments and how it drives is_warmed_up on the
             # returned ROIParameters.
+        self._min_width_norm  = float(min_width_norm)   # model input guard (Point 11)
+        self._min_height_norm = float(min_height_norm)  # never shrink below scaler minimum
 
         if camera is not None:
             _validate_camera_intrinsics(camera)
@@ -3486,6 +3490,17 @@ class ROIGenerator:
         # Re-enforce floor after clamp: the height clamp (HOOD_Y_BOTTOM=0.97)
         # must not override the ABS-active floor that can legitimately reach 1.0.
         roi = _union_with_floor(roi, base_roi_for_cap)
+
+        # Guard: ROI must never be smaller than the hardware scaler's minimum
+        # input size (model input dimensions ÷ sensor resolution). If the ROI
+        # goes below this, tiovxmultiscaler falls back to software videoscale
+        # which pins the ARM core at ~74%. Applied last so it overrides all
+        # other reductions — safety > efficiency.
+        if self._min_width_norm > 0.0 or self._min_height_norm > 0.0:
+            roi = replace(roi,
+                width=max(roi.width, self._min_width_norm),
+                height=max(roi.height, self._min_height_norm),
+            )
 
         self.prev_roi = roi
         return roi

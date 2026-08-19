@@ -2186,20 +2186,53 @@ class PostProcessLaneDetection(PostProcess):
         )
 
     def _draw_detections(self, img):
-        """Run the secondary detector on this frame and draw its boxes."""
+        """Run the secondary detector on the current ROI crop and draw its boxes.
+
+        When current_roi is set, YOLOX runs on the same cropped region used for
+        lane inference (same FOV as UFLDv2). Bounding boxes are translated back
+        to full-frame normalised coordinates before caching and drawing so that
+        downstream ROI-expansion logic and display coordinates are always
+        expressed in full-frame space.
+        """
+        h, w = img.shape[0], img.shape[1]
+
+        # Determine crop region: ROI crop when available, full frame otherwise.
+        roi = self.current_roi
+        ox_norm, oy_norm, crop_w_norm, crop_h_norm = 0.0, 0.0, 1.0, 1.0
+        source = img
+        if roi is not None:
+            cx0 = max(0, int(roi.x_left * w))
+            cy0 = max(0, int(roi.y_top * h))
+            cx1 = min(w, int((roi.x_left + roi.width) * w))
+            cy1 = min(h, int((roi.y_top + roi.height) * h))
+            if cx1 > cx0 and cy1 > cy0:
+                source = img[cy0:cy1, cx0:cx1]
+                ox_norm      = cx0 / w
+                oy_norm      = cy0 / h
+                crop_w_norm  = (cx1 - cx0) / w
+                crop_h_norm  = (cy1 - cy0) / h
+
         # Plain resize, matching what tiovxdlpreproc does for this model
         # (caps are a bare 416x416 with no videobox/letterbox padding).
         resized = cv2.resize(
-            img, (self.od_w, self.od_h), interpolation=cv2.INTER_LINEAR
+            source, (self.od_w, self.od_h), interpolation=cv2.INTER_LINEAR
         )
         tensor = np.ascontiguousarray(
             resized.transpose(2, 0, 1)[None].astype(self.od_dtype)
         )
 
-        bbox = decode_detections(self.od_model.run_time(tensor), self.od_model)
-        self._cached_od_bbox = bbox  # expose to _extract_detections without re-running inference
+        bbox_raw = decode_detections(self.od_model.run_time(tensor), self.od_model)
+        bbox = []
+        for b in bbox_raw:
+            translated = list(b)
+            translated[0] = ox_norm + b[0] * crop_w_norm  # x1
+            translated[1] = oy_norm + b[1] * crop_h_norm  # y1
+            translated[2] = ox_norm + b[2] * crop_w_norm  # x2
+            translated[3] = oy_norm + b[3] * crop_h_norm  # y2
+            bbox.append(translated)
 
-        h, w = img.shape[0], img.shape[1]
+        self._cached_od_bbox = bbox  # full-frame coords; used by _extract_detections
+
         font = cv2.FONT_HERSHEY_SIMPLEX
         for b in bbox:
             if b[5] <= self.od_model.viz_threshold:

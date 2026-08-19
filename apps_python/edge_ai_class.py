@@ -233,9 +233,20 @@ class EdgeAIDemo:
                 image_height_px=cam_cfg["image_height_px"],
                 mount_height_m=cam_cfg["mounting_height_m"],
             )
+            # Guard: ROI must never shrink below model input size or the
+            # hardware scaler falls back to slow software videoscale.
+            # Take the most restrictive constraint across all sub-flows.
+            min_w_norm, min_h_norm = 0.0, 0.0
+            for f in self.flows:
+                for s in f.sub_flows:
+                    if s.sensor_width > 0 and s.sensor_height > 0:
+                        min_w_norm = max(min_w_norm, s.model.crop[0] / s.sensor_width)
+                        min_h_norm = max(min_h_norm, s.model.crop[1] / s.sensor_height)
             self.roi_generator = ROIGenerator(
                 camera=cam,
                 isa_enabled=roi_cfg.get("isa_enabled", True),
+                min_width_norm=min_w_norm,
+                min_height_norm=min_h_norm,
             )
             can_mode = roi_cfg.get("can_mode", "mock")
             can_csv  = roi_cfg.get("can_csv", None)
