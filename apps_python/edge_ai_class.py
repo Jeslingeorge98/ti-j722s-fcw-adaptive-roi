@@ -34,6 +34,7 @@ from gst_element_map import gst_element_map
 from edgeai_dl_inferer import ModelConfig
 from infer_pipe import InferPipe
 from roi.dynamic_roi import ROIGenerator, CameraIntrinsics
+from roi.shared_state import SharedROIState, SharedFeedbackState
 from can_interface import CANSignalReader
 import utils
 import sys
@@ -61,6 +62,16 @@ class EdgeAIDemo:
         self.flows = []
         self.infer_pipes = []
         self.title = config["title"]
+
+        # Publish hardware-ROI mode flags to gst_wrapper BEFORE flows are
+        # built — SubFlow.__init__ calls get_scaler_elements / get_pre_proc_elements
+        # and needs to see these flags at pipeline-construction time.
+        _roi_cfg = config.get("roi_config", {}) or {}
+        gst_wrapper.HARDWARE_ROI = _roi_cfg.get("hardware_roi", False)
+        gst_wrapper.ROI_RESIZE_MODE = _roi_cfg.get("roi_resize_mode", "letterbox")
+        gst_wrapper.SHARED_ROI_FOR_MODELS = _roi_cfg.get(
+            "shared_roi_for_models", False
+        )
 
         for f in config["flows"]:
             flow = config["flows"][f]
@@ -233,15 +244,17 @@ class EdgeAIDemo:
                 image_height_px=cam_cfg["image_height_px"],
                 mount_height_m=cam_cfg["mounting_height_m"],
             )
-            # Guard: ROI must never shrink below model input size or the
-            # hardware scaler falls back to slow software videoscale.
-            # Take the most restrictive constraint across all sub-flows.
+            # ROI is normalised on the multiscaler INPUT dims (source frame),
+            # not the sensor branch's output panel. Using sensor_width here
+            # would over-constrain the ROI (e.g. 640/960=0.667 instead of
+            # 640/1920=0.333). Compute against s.input.width/height, which
+            # matches what set_hw_roi() actually multiplies by at runtime.
             min_w_norm, min_h_norm = 0.0, 0.0
             for f in self.flows:
                 for s in f.sub_flows:
-                    if s.sensor_width > 0 and s.sensor_height > 0:
-                        min_w_norm = max(min_w_norm, s.model.crop[0] / s.sensor_width)
-                        min_h_norm = max(min_h_norm, s.model.crop[1] / s.sensor_height)
+                    if s.input.width > 0 and s.input.height > 0:
+                        min_w_norm = max(min_w_norm, s.model.crop[0] / s.input.width)
+                        min_h_norm = max(min_h_norm, s.model.crop[1] / s.input.height)
             self.roi_generator = ROIGenerator(
                 camera=cam,
                 isa_enabled=roi_cfg.get("isa_enabled", True),
@@ -251,16 +264,42 @@ class EdgeAIDemo:
             can_mode = roi_cfg.get("can_mode", "mock")
             can_csv  = roi_cfg.get("can_csv", None)
             self.can_reader = CANSignalReader(mode=can_mode, csv_path=can_csv)
+            self.shared_roi_state = SharedROIState()
+            self.shared_feedback  = SharedFeedbackState()
         else:
             self.roi_generator = None
             self.can_reader    = None
+            self.shared_roi_state = None
+            self.shared_feedback  = None
+
+        # Elect a single "ROI master" — the subflow that actually calls
+        # roi_generator.step() every frame and publishes to shared_roi_state.
+        # Every other subflow reads from shared_roi_state (no independent step).
+        # Prefer lane_detection since ROI logic is driven off lane feedback;
+        # fall back to the first subflow when no lane detector is present.
+        roi_master = None
+        if self.roi_generator is not None:
+            for f in self.flows:
+                for s in f.sub_flows:
+                    if getattr(s.model, "task_type", None) == "lane_detection":
+                        roi_master = s
+                        break
+                if roi_master:
+                    break
+            if roi_master is None and self.flows and self.flows[0].sub_flows:
+                roi_master = self.flows[0].sub_flows[0]
 
         for f in self.flows:
             for s in f.sub_flows:
+                is_master = (s is roi_master)
                 self.infer_pipes.append(
-                    InferPipe(s, self.gst_pipe,
-                              roi_generator=self.roi_generator,
-                              can_reader=self.can_reader)
+                    InferPipe(
+                        s, self.gst_pipe,
+                        roi_generator=self.roi_generator if is_master else None,
+                        can_reader=self.can_reader if is_master else None,
+                        shared_roi_state=self.shared_roi_state,
+                        shared_feedback=self.shared_feedback,
+                    )
                 )
 
     def start(self):
@@ -272,6 +311,17 @@ class EdgeAIDemo:
                 o.bg_pipe.start()
                 o.bg_pipe.push_frame(o.title_frame, o.gst_bkgnd_sink)
                 o.bg_pipe.free()
+
+        # Prime each DL branch's multiscaler with a valid ROI before frames
+        # start flowing. Default roi-* on tiovxmultiscaler is 0x0, which
+        # blocks caps negotiation on the first buffer; set_hw_roi() clamps
+        # the identity ROI into a per-subflow valid range.
+        if (self.shared_roi_state is not None
+                and gst_wrapper.HARDWARE_ROI
+                and gst_wrapper.ROI_RESIZE_MODE == "direct"):
+            initial_roi, _ = self.shared_roi_state.get()
+            for pipe in self.infer_pipes:
+                self.gst_pipe.set_hw_roi(pipe.sub_flow, initial_roi)
 
         self.gst_pipe.start()
         for i in self.infer_pipes:

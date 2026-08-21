@@ -34,6 +34,7 @@ import threading
 import queue
 import utils
 import debug
+import gst_wrapper
 from post_process import PostProcess
 from roi.dynamic_roi import ROIParameters, LaneInfo, DetectedObject, ObjectCategory
 
@@ -42,22 +43,43 @@ class InferPipe:
     Class to abstract the threading of multiple inference pipelines
     """
 
-    def __init__(self, sub_flow, gst_pipe, roi_generator=None, can_reader=None):
+    def __init__(self, sub_flow, gst_pipe, roi_generator=None, can_reader=None,
+                 shared_roi_state=None, shared_feedback=None):
         """
         Constructor to create an InferPipe object.
         Args:
             sub_flow: sub_flow configuration
             gst_pipe: gstreamer pipe object
-            roi_generator: ROIGenerator instance shared across all pipes (Step 3)
-            can_reader: CANSignalReader instance shared across all pipes (Step 3)
+            roi_generator: ROIGenerator instance — only the ROI master pipe gets
+                one. Followers receive None and read the current ROI from
+                shared_roi_state instead of stepping the generator themselves.
+            can_reader: CANSignalReader — only the ROI master pipe gets one.
+            shared_roi_state: SharedROIState — the single ROI value published by
+                the master and read by all followers. None when ROI is disabled.
+            shared_feedback: SharedFeedbackState — cross-subflow feedback so the
+                master's ROIGenerator.step() can see lane info (from itself)
+                and object detections (from the follower).
         """
         self.sub_flow = sub_flow
         self.gst_pipe = gst_pipe
         self.roi_generator = roi_generator
         self.can_reader    = can_reader
+        self.shared_roi_state = shared_roi_state
+        self.shared_feedback  = shared_feedback
+        # A pipe is the "ROI master" if it owns the generator + CAN reader.
+        # Every pipe still applies the current ROI to its own scaler pad.
+        self._is_roi_master = (roi_generator is not None and can_reader is not None)
+        self._hw_roi_direct = (
+            gst_wrapper.HARDWARE_ROI and gst_wrapper.ROI_RESIZE_MODE == "direct"
+        )
         self.fallback_roi  = ROIParameters(x_left=0.0, y_top=0.0, width=1.0, height=1.0)
         self._current_roi  = self.fallback_roi
         self._roi_lock     = threading.Lock()
+        # Sequence of the last ROI this follower consumed from shared state.
+        # Used by wait_next() so followers block until the master publishes a
+        # fresh ROI for the next frame (rough per-frame synchronisation).
+        self._last_roi_seq = 0
+        self._roi_lag_frames = 0  # diagnostic: how many frames follower missed
         self._latest_lane_info = LaneInfo(center_norm=None, width_norm=None, confidence=0.0)
         self._latest_objects   = []
         self._feedback_lock    = threading.Lock()
@@ -89,6 +111,7 @@ class InferPipe:
         # latency and gives stage 1 backpressure when stage 2 falls behind.
         self.result_queue = queue.Queue(maxsize=2)
         self.post_thread = threading.Thread(target=self.post_pipeline)
+        self._post_frame_idx = 0
         self.stop_thread = False
 
     def start(self):
@@ -122,19 +145,30 @@ class InferPipe:
         """
         try:
             while self.stop_thread == False:
-                # Compute dynamic ROI before pulling the tensor
-                if self.roi_generator is not None and self.can_reader is not None:
-                    can_sig   = self.can_reader.get_latest()
-                    lane_info = self._get_latest_lane_info()
+                # ROI: master computes once and publishes; followers just read.
+                # Doing it any other way would step() twice per frame and
+                # advance the mock CAN reader twice.
+                roi = None
+                if self._is_roi_master:
+                    can_sig = self.can_reader.get_latest()
+                    # Prefer cross-subflow feedback (the object subflow writes
+                    # its detections there). Fall back to self-cached feedback
+                    # when no shared state is wired.
+                    if self.shared_feedback is not None:
+                        lane_info = self.shared_feedback.get_lane_info()
+                        objects   = self.shared_feedback.get_objects()
+                    else:
+                        lane_info = self._get_latest_lane_info()
+                        objects   = self._get_latest_objects()
                     _t0 = time()
                     roi = self.roi_generator.step(
                         lane_info, can_sig, self.fallback_roi,
-                        objects=self._get_latest_objects(),
+                        objects=objects,
                     )
                     _roi_ms = (time() - _t0) * 1000.0
                     self._roi_latency_ms.append(_roi_ms)
-                    with self._roi_lock:
-                        self._current_roi = roi
+                    if self.shared_roi_state is not None:
+                        self._last_roi_seq = self.shared_roi_state.set(roi)
                     if self.sub_flow.debug_config:
                         print(
                             f"ROI L{roi.roi_level} | "
@@ -143,6 +177,26 @@ class InferPipe:
                             f"warmed={roi.is_warmed_up} | "
                             f"implausible_spd={roi.speed_was_implausible}"
                         )
+                elif self.shared_roi_state is not None:
+                    # Follower: block until the master publishes a ROI newer
+                    # than the one we consumed last iteration. Timeout keeps
+                    # this responsive on shutdown; if it fires we just reuse
+                    # the previous ROI (one-frame lag) and log the miss.
+                    roi, seq = self.shared_roi_state.wait_next(
+                        self._last_roi_seq, timeout=0.2
+                    )
+                    if seq == self._last_roi_seq:
+                        self._roi_lag_frames += 1
+                    self._last_roi_seq = seq
+
+                if roi is not None:
+                    with self._roi_lock:
+                        self._current_roi = roi
+                    # Apply the ROI to this branch's scaler src pad *before*
+                    # pulling the tensor — the very next appsink buffer will
+                    # then be produced from the cropped region.
+                    if self._hw_roi_direct:
+                        self.gst_pipe.set_hw_roi(self.sub_flow, roi)
 
                 input_img = self.gst_pipe.pull_tensor(
                     self.gst_pre_inp,
@@ -169,7 +223,10 @@ class InferPipe:
 
                 # Copy before handing off: this thread starts the next inference
                 # immediately and must not overwrite tensors stage 2 is reading.
-                if not self._enqueue([r.copy() for r in result]):
+                # Ship the ROI alongside so stage 2 can remap ROI-local coords
+                # (bboxes, lane points) back to full frame.
+                envelope = ([r.copy() for r in result], roi)
+                if not self._enqueue(envelope):
                     break
         finally:
             # Sentinel tells stage 2 no more frames are coming. Stage 2 owns the
@@ -200,38 +257,71 @@ class InferPipe:
         try:
             while True:
                 try:
-                    result = self.result_queue.get(timeout=0.2)
+                    envelope = self.result_queue.get(timeout=0.2)
                 except queue.Empty:
                     if self.stop_thread:
                         break
                     continue
 
-                if result is None:
+                if envelope is None:
                     break
 
-                frame = self.gst_pipe.pull_frame(
+                result, roi = envelope
+
+                frame, src_pts, src_dur = self.gst_pipe.pull_frame(
                     self.gst_sen_inp, self.sub_flow.input.loop
                 )
                 if frame is None:
                     break
 
-                # Pass current ROI to post_proc so it can draw the rectangle
-                # on the sensor frame in the same pass as lanes and detections
-                if self.roi_generator is not None:
-                    with self._roi_lock:
-                        self.post_proc.current_roi = self._current_roi
+                # Pass current ROI to post_proc so it can (a) draw the
+                # rectangle on the full-frame sensor image and (b) unmap
+                # ROI-local model outputs back to full-frame coords when
+                # running in hardware_roi direct mode.
+                if roi is not None:
+                    self.post_proc.current_roi = roi
+                    self.post_proc.hw_roi_direct = self._hw_roi_direct
 
                 out_frame = self.post_proc(frame, result)
 
                 # Feed previous-frame lane/detection results back for next ROI
                 img_h, img_w = frame.shape[0], frame.shape[1]
                 lane_info = _extract_lane_info(result, self.post_proc, img_h, img_w)
-                objects   = _extract_detections(result, self.post_proc)
+                # Remap ROI-local detections back to full-frame normalised
+                # coords BEFORE feeding them into the ROI generator — the
+                # generator's corridor / expansion math assumes full-frame
+                # coordinates.
+                objects   = _extract_detections(
+                    result, self.post_proc,
+                    roi=roi if self._hw_roi_direct else None,
+                )
                 with self._feedback_lock:
                     self._latest_lane_info = lane_info
                     self._latest_objects   = objects
+                # Publish to the cross-subflow feedback so the ROI master
+                # (lane subflow) sees the object subflow's detections next
+                # iteration. Each subflow writes what its own model produces;
+                # None-writes are ignored inside SharedFeedbackState.
+                if self.shared_feedback is not None:
+                    self.shared_feedback.set_lane_info(lane_info)
+                    self.shared_feedback.set_objects(objects)
 
-                self.gst_pipe.push_frame(out_frame, self.gst_post_out)
+                # Prefer the source buffer's PTS so the mkv timeline matches
+                # the source video's timeline (dropped source frames just
+                # leave PTS gaps instead of stretching wall-clock). Fall back
+                # to frame_id×1/fps when the source didn't stamp PTS.
+                if src_pts is not None:
+                    self.gst_pipe.push_frame(
+                        out_frame, self.gst_post_out,
+                        pts=src_pts, duration=src_dur,
+                    )
+                else:
+                    self.gst_pipe.push_frame(
+                        out_frame, self.gst_post_out,
+                        frame_id=self._post_frame_idx,
+                        fps=self.sub_flow.input.fps,
+                    )
+                self._post_frame_idx += 1
                 # Increment frame count
                 self.sub_flow.report.report_frame()
         finally:
@@ -345,24 +435,30 @@ _SIGNAL_NAMES     = {'traffic light'}
 _SIGN_ROAD_NAMES  = {'stop sign'}
 
 
-def _extract_detections(result, post_proc):
+def _extract_detections(result, post_proc, roi=None):
     """
-    Build List[DetectedObject] for ROI expansion.
+    Build List[DetectedObject] for ROI expansion, in full-frame coords.
 
     For a primary-detector pipeline (PostProcessDetection): decodes the main
-    model's output tensors.
+    model's output tensors. When roi is given (hardware ROI direct mode),
+    the decoded bboxes are ROI-local; they get remapped to full-frame
+    normalised coords before being wrapped in DetectedObject.
     For a lane-detection pipeline (PostProcessLaneDetection): reads the YOLOX
-    overlay bbox results already decoded by _draw_detections() — no second
-    inference call or tensor decode needed.
+    overlay bbox results already decoded by _draw_detections() — those are
+    already in full-frame coords, so no remap is needed here.
     Returns [] if no usable detection results are available.
     """
     from post_process import PostProcessDetection, PostProcessLaneDetection, \
         decode_detections, resolve_class
 
+    remap = False
     if isinstance(post_proc, PostProcessDetection):
         try:
             bbox  = decode_detections(result, post_proc.model)
             model = post_proc.model
+            # decode_detections returns ROI-local normalised coords whenever
+            # the DL branch was cropped by the hardware scaler.
+            remap = roi is not None
         except Exception:
             return []
     elif isinstance(post_proc, PostProcessLaneDetection) and post_proc.od_model is not None:
@@ -387,7 +483,16 @@ def _extract_detections(result, post_proc):
                 category = ObjectCategory.SIGN_ROADSIDE
             else:
                 continue
-            x1, y1, x2, y2 = (max(0.0, min(1.0, float(b[i]))) for i in range(4))
+            x1, y1, x2, y2 = (float(b[i]) for i in range(4))
+            if remap:
+                x1 = roi.x_left + x1 * roi.width
+                y1 = roi.y_top  + y1 * roi.height
+                x2 = roi.x_left + x2 * roi.width
+                y2 = roi.y_top  + y2 * roi.height
+            x1 = max(0.0, min(1.0, x1))
+            y1 = max(0.0, min(1.0, y1))
+            x2 = max(0.0, min(1.0, x2))
+            y2 = max(0.0, min(1.0, y2))
             if x2 <= x1 or y2 <= y1:
                 continue
             objects.append(DetectedObject(

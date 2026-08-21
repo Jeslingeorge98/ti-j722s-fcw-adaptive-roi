@@ -1,0 +1,100 @@
+title: "FCW with Adaptive ROI  Two-DSP Parallel (J722SXH01EVM)"
+
+# Two flows, one per model, each with its own InferPipe thread pair.
+# tiovxmosaic composites both outputs into a single 1920×1080 mkv file
+# sized to the display: two 960×540 panels centered vertically (letterboxed).
+#
+# What the framework builds:
+#   SubFlow-0 (UFLDv2, core_id 2)
+#     GStreamer: split_01.pad0 → colorconvert → videobox → tiovxdlpreproc(float32)
+#                → appsink pre_0   (640×256 NCHW float32 tensor)
+#                split_01.pad0 → colorconvert → appsink sen_0   (1280×720 RGB frame)
+#                appsrc post_0 → tiovxmosaic[0,270,960,540]  ─┐
+#     InferPipe-0 threads: T_pipeline_0 → UFLDv2 on C7x-2 (~55 ms)
+#                          T_post_0     → draw lanes → push_frame
+#
+#   SubFlow-1 (YOLOX, core_id 1)
+#     GStreamer: split_01.pad1 → colorconvert → tiovxdlpreproc(uint8,BGR,416x416)
+#                → appsink pre_1   (416×416 NCHW uint8 tensor)
+#                split_01.pad1 → colorconvert → appsink sen_1   (1280×720 RGB frame)
+#                appsrc post_1 → tiovxmosaic[960,270,960,540] ─┤
+#     InferPipe-1 threads: T_pipeline_1 → YOLOX on C7x-1 (~40 ms)        │
+#                          T_post_1     → draw boxes → push_frame         │
+#                                                                          ▼
+#                                               v4l2h264enc → output_fcw_parallel.mkv (1920×1080)
+#
+# Both T_pipeline_0 and T_pipeline_1 block inside their respective TIDL
+# run_time() calls simultaneously.  TIDL releases the GIL while the DSP
+# executes, so both C7x cores are busy at the same time — true hardware
+# parallelism, not time-sliced.
+
+log_level: 2
+
+roi_config:
+  camera:
+    focal_length_px: 2165.2
+    principal_point_x_px: 953.0
+    principal_point_y_px: 553.0
+    image_width_px: 1920
+    image_height_px: 1080
+    mounting_height_m: 1.5
+  isa_enabled: true
+  can_mode: mock
+  can_csv: /opt/online_test_data/can_signals_indian_road_curve_30fps.csv
+
+  # Hardware ROI mode:
+  #   hardware_roi           — crop happens in the VPAC MSC (tiovxmultiscaler),
+  #                            not in Python. No numpy crop, no cv2.resize.
+  #   roi_resize_mode:direct — scale the cropped ROI straight to each model's
+  #                            input caps (640×256 for UFLDv2, 416×416 for YOLOX).
+  #                            No letterbox / aspect-preserving pad.
+  #   shared_roi_for_models  — the same ROI rectangle (from DynamicROI) feeds
+  #                            both scaler branches; each branch keeps its own
+  #                            output caps, so the two models share geometry
+  #                            but produce independently-shaped tensors.
+  hardware_roi: true
+  roi_resize_mode: direct
+  shared_roi_for_models: true
+
+inputs:
+  input0:
+    source: /opt/online_test_data/indian_road_curve_30fps.mp4
+    format: mp4
+    width: 1920
+    height: 1080
+    framerate: 30
+    loop: False
+    # Offline file run: keep every frame and let the decode path backpressure.
+    # Real-time camera/RTSP configs can keep drop: True to prefer low latency.
+    drop: False
+
+models:
+  # Lane detection — UFLDv2 — dedicated to C7x-2
+  # No overlay_detection_model: YOLOX is now its own flow running in parallel.
+  model0:
+    model_path: /opt/model_zoo/LD-ufldv2-culane-exp01-res18-256x640
+    viz_threshold: 0.6
+    core_id: 2
+
+  # Object detection — YOLOX-nano-lite — dedicated to C7x-1
+  model1:
+    model_path: /opt/model_zoo/ONR-OD-8200-yolox-nano-lite-mmdet-coco-416x416
+    viz_threshold: 0.4
+    core_id: 1
+
+outputs:
+  # File-only output — no display sink. Encoded H.264 in an mkv container via
+  # v4l2h264enc → matroskamux → filesink; copy to host with scp afterwards.
+  # Frame is 1920×1080 with two 960×540 panels (16:9, source aspect preserved)
+  # centered vertically. Playable at 1920×1080 on a viewer of your choice.
+  output0:
+    sink: /opt/online_test_data/output/output_fcw_parallel.mkv
+    width: 1920
+    height: 1080
+
+flows:
+  # Both flows share input0 → one GStreamer source pipeline, two scaler branches.
+  # Each branch gets its own InferPipe + C7x core; mosaic positions merge them
+  # into a single 1920×1080 file (left = lanes, right = bounding boxes).
+  flow0: [input0, model0, output0, [0,   270, 960, 540]]   # UFLDv2 C7x-2 → left panel
+  flow1: [input0, model1, output0, [960, 270, 960, 540]]   # YOLOX  C7x-1 → right panel

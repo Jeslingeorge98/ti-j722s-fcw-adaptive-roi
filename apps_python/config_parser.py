@@ -300,6 +300,11 @@ class SubFlow:
             self, is_multi_src=flow.is_multi_scaler
         )
         self.gst_pre_src_name = "pre_%d" % self.id
+        # Set later in gst_wrapper.get_gst_pipe once the DL path is linked to
+        # the multiscaler — holds the tiovxmultiscaler src pad name (e.g.
+        # "src_1") feeding this subflow's DL branch. Used to route ROI crop
+        # properties at runtime.
+        self.gst_dl_scaler_pad_name = None
         self.gst_pre_proc_elements = gst_wrapper.get_pre_proc_elements(self)
         self.input.increase_split()
         self.gst_sen_src_name = "sen_%d" % self.id

@@ -1175,6 +1175,14 @@ class PostProcess:
         self.debug_str = ""
         self.frame_count = 0
         self.last_capture_time = time.monotonic()
+
+        # Hardware ROI state — populated by InferPipe each frame before
+        # __call__(). current_roi is the (normalised) rectangle that was fed
+        # into the scaler; hw_roi_direct is True when the model tensor arrived
+        # already cropped by hardware (so its output coords are ROI-local and
+        # need to be remapped back to full-frame here).
+        self.current_roi = None
+        self.hw_roi_direct = False
         
         # Result logging is opt-in because it creates CSV/image output and adds
         # disk I/O. Set ENABLE_ASYNC_LOGGER=1 to enable it.
@@ -1442,6 +1450,12 @@ class PostProcessDetection(PostProcess):
             "pedestrian": "person",
         }
 
+        # bbox_only: when True, __call__() draws just plain rectangles +
+        # class labels and skips the full ADAS overlay (road perspective,
+        # tracker, distance/TTC/FCW, HUD panels, side lists, big warning
+        # icons). Keeps output clean for the parallel-flow mosaic panel.
+        self.bbox_only = True
+
         # Performance monitoring
         self.processing_times = deque(maxlen=100)
         self.frame_latencies = deque(maxlen=100)
@@ -1649,6 +1663,9 @@ class PostProcessDetection(PostProcess):
 
     def __call__(self, img: np.ndarray, results) -> np.ndarray:
         """Main processing function."""
+        if self.bbox_only:
+            return self._draw_bbox_only(img, results)
+
         processing_start = time.monotonic()
         capture_time = processing_start
 
@@ -1702,6 +1719,16 @@ class PostProcessDetection(PostProcess):
         if not self.model.normalized_detections:
             bbox[..., (0, 2)] /= self.model.resize[0]
             bbox[..., (1, 3)] /= self.model.resize[1]
+
+        # Hardware ROI direct mode: the model tensor was cropped by the
+        # scaler, so bboxes are ROI-local ([0,1] over the ROI rectangle).
+        # Remap them into full-frame normalised space before pixel scaling.
+        if self.hw_roi_direct and self.current_roi is not None:
+            roi = self.current_roi
+            bbox[..., 0] = roi.x_left + bbox[..., 0] * roi.width   # x1
+            bbox[..., 1] = roi.y_top  + bbox[..., 1] * roi.height  # y1
+            bbox[..., 2] = roi.x_left + bbox[..., 2] * roi.width   # x2
+            bbox[..., 3] = roi.y_top  + bbox[..., 3] * roi.height  # y2
 
         boxes = []
         scores = []
@@ -1870,6 +1897,99 @@ class PostProcessDetection(PostProcess):
             self.debug.log(self.debug_str)
             self.debug_str = ""
 
+        return img
+
+    def _draw_bbox_only(self, img: np.ndarray, results) -> np.ndarray:
+        """Minimal per-frame draw: decode → NMS → plain rectangle + label.
+
+        Skips the full ADAS overlay (road perspective, tracker, distance/TTC,
+        FCW logic, HUD panels, side lists, warning icons). Used for the
+        two-DSP parallel mosaic panel where only the detection result is
+        wanted alongside the lane panel.
+        """
+        # Decode & normalise bboxes exactly like the full pipeline does.
+        for i, r in enumerate(results):
+            r = np.squeeze(r)
+            if r.ndim == 1:
+                r = np.expand_dims(r, 1)
+            results[i] = r
+
+        if self.model.shuffle_indices:
+            results = [results[i] for i in self.model.shuffle_indices]
+
+        if results[-1].ndim < 2:
+            results = results[:-1]
+
+        bbox = np.concatenate(results, axis=-1)
+
+        if not self.model.normalized_detections:
+            bbox[..., (0, 2)] /= self.model.resize[0]
+            bbox[..., (1, 3)] /= self.model.resize[1]
+
+        # HW ROI direct mode: bboxes are ROI-local; remap to full frame.
+        if self.hw_roi_direct and self.current_roi is not None:
+            roi = self.current_roi
+            bbox[..., 0] = roi.x_left + bbox[..., 0] * roi.width
+            bbox[..., 1] = roi.y_top  + bbox[..., 1] * roi.height
+            bbox[..., 2] = roi.x_left + bbox[..., 2] * roi.width
+            bbox[..., 3] = roi.y_top  + bbox[..., 3] * roi.height
+
+        boxes, scores, class_indices = [], [], []
+        h, w = img.shape[0], img.shape[1]
+        for b in bbox:
+            if b[5] > self.model.viz_threshold:
+                x1 = int(max(0, min(w - 1, b[0] * w)))
+                y1 = int(max(0, min(h - 1, b[1] * h)))
+                x2 = int(max(0, min(w - 1, b[2] * w)))
+                y2 = int(max(0, min(h - 1, b[3] * h)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                boxes.append([x1, y1, x2, y2])
+                scores.append(float(b[5]))
+                class_indices.append(int(b[4]))
+
+        if boxes:
+            nms_boxes, nms_scores, nms_class_indices, _ = apply_nms_with_indices(
+                boxes, scores, class_indices, iou_threshold=0.5
+            )
+        else:
+            nms_boxes, nms_scores, nms_class_indices = [], [], []
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for (x1, y1, x2, y2), score, cls in zip(
+            nms_boxes, nms_scores, nms_class_indices
+        ):
+            class_name, color = resolve_class(self.model, cls)
+            label_name = class_name.split('/')[-1]
+            label = f"{label_name} {score * 100:.0f}%"
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            (tw, th), _ = cv2.getTextSize(label, font, 0.45, 1)
+            ty = y1 - 4 if y1 > th + 6 else y2 + th + 4
+            cv2.rectangle(img, (x1, ty - th - 3), (x1 + tw + 6, ty + 3), color, -1)
+            cv2.putText(img, label, (x1 + 3, ty), font, 0.45,
+                        (0, 0, 0), 1, cv2.LINE_8)
+
+        # Draw the ROI rectangle so this panel matches the lane panel
+        # visually (same rectangle shown on both sides of the mosaic).
+        if self.current_roi is not None:
+            roi = self.current_roi
+            x1 = int(roi.x_left * w)
+            y1 = int(roi.y_top  * h)
+            x2 = int((roi.x_left + roi.width)  * w)
+            y2 = int((roi.y_top  + roi.height) * h)
+            colours = {0: (0, 255, 0), 1: (0, 255, 255),
+                       2: (0, 165, 255), 3: (0, 0, 255)}
+            colour = colours.get(getattr(roi, "roi_level", 0), (255, 255, 255))
+            cv2.rectangle(img, (x1, y1), (x2, y2), colour, 2)
+            cv2.putText(
+                img,
+                f"ROI L{getattr(roi, 'roi_level', 0)}  "
+                f"{roi.width * roi.height * 100:.0f}%",
+                (x1 + 4, max(y1 + 20, 20)),
+                font, 0.6, colour, 2, cv2.LINE_AA,
+            )
+
+        self.frame_count += 1
         return img
 
     def overlay_bounding_box_with_state(self, frame, box, class_name, track_id, color,
@@ -2280,13 +2400,34 @@ class PostProcessLaneDetection(PostProcess):
 
         img_h, img_w = img.shape[0], img.shape[1]
 
-        lanes = pred2coords(
-            loc_row, loc_col, exist_row, exist_col,
-            self.row_anchor, self.col_anchor,
-            row_lane_idx=self.row_lane_idx, col_lane_idx=self.col_lane_idx,
-            local_width=self.local_width,
-            original_image_width=img_w, original_image_height=img_h,
-        )
+        # Hardware ROI direct mode: the tensor was cropped to the ROI, so
+        # pred2coords must decode against ROI pixel dims and the resulting
+        # points must be offset by the ROI origin (full-frame pixel space).
+        if self.hw_roi_direct and self.current_roi is not None:
+            roi = self.current_roi
+            roi_w_px = max(1, int(roi.width  * img_w))
+            roi_h_px = max(1, int(roi.height * img_h))
+            x_off_px = int(roi.x_left * img_w)
+            y_off_px = int(roi.y_top  * img_h)
+            raw = pred2coords(
+                loc_row, loc_col, exist_row, exist_col,
+                self.row_anchor, self.col_anchor,
+                row_lane_idx=self.row_lane_idx, col_lane_idx=self.col_lane_idx,
+                local_width=self.local_width,
+                original_image_width=roi_w_px, original_image_height=roi_h_px,
+            )
+            lanes = [
+                (lid, [(int(x + x_off_px), int(y + y_off_px)) for (x, y) in pts])
+                for (lid, pts) in raw
+            ]
+        else:
+            lanes = pred2coords(
+                loc_row, loc_col, exist_row, exist_col,
+                self.row_anchor, self.col_anchor,
+                row_lane_idx=self.row_lane_idx, col_lane_idx=self.col_lane_idx,
+                local_width=self.local_width,
+                original_image_width=img_w, original_image_height=img_h,
+            )
 
         lane_dict = {}
         for lane_id, points in lanes:

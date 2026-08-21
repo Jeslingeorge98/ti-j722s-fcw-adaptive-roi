@@ -19,6 +19,14 @@ preproc_target_idx = 0
 isp_target_idx = 0
 ldc_target_idx = 0
 
+# Hardware ROI mode flags (set from roi_config by EdgeAIDemo before flows build).
+# When HARDWARE_ROI is on with ROI_RESIZE_MODE == "direct":
+#   - DL scaler output caps = model input size (no letterbox / pre_proc_resize stage)
+#   - videobox crop for lane_detection / classification is skipped
+HARDWARE_ROI = False
+ROI_RESIZE_MODE = "letterbox"
+SHARED_ROI_FOR_MODELS = False
+
 class GstPipe:
     """
     Class to handle gstreamer pipeline related things
@@ -81,7 +89,12 @@ class GstPipe:
 
     def pull_frame(self, src, loop):
         """
-        Pull a frame from gst pipeline
+        Pull a frame from gst pipeline.
+
+        Returns a (frame, pts, duration) triple. `pts` and `duration` come
+        straight from the source buffer so downstream code can preserve the
+        source's timeline instead of restamping with wall-clock time. Either
+        can be None when the source didn't carry that field.
         Args:
             src: gst src element from which the frame is pulled
             loop: If src need to be looped after eos
@@ -95,10 +108,10 @@ class GstPipe:
                         src.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0)
                         sample = src.try_pull_sample(5000000000)
                 else:
-                    return None
+                    return None, None, None
             else:
                 print("[ERROR] Error pulling frame from GST Pipeline")
-                return None
+                return None, None, None
         caps = sample.get_caps()
 
         struct = caps.get_structure(0)
@@ -106,11 +119,16 @@ class GstPipe:
         height = struct.get_value("height")
 
         buffer = sample.get_buffer()
+        pts = buffer.pts if buffer.pts != Gst.CLOCK_TIME_NONE else None
+        dur = buffer.duration if buffer.duration != Gst.CLOCK_TIME_NONE else None
         _, map_info = buffer.map(Gst.MapFlags.READ)
-        frame = copy.deepcopy(np.ndarray((height, width, 3), np.uint8, map_info.data))
+        # np.ndarray(..., map_info.data) is a VIEW; copy before unmap so the
+        # returned array owns its memory. .copy() is a direct memcpy —
+        # significantly faster than copy.deepcopy() on an ndarray.
+        frame = np.ndarray((height, width, 3), np.uint8, map_info.data).copy()
         buffer.unmap(map_info)
 
-        return frame
+        return frame, pts, dur
 
     def pull_tensor(self, src, loop, width, height, layout, data_type):
         """
@@ -138,22 +156,62 @@ class GstPipe:
                 return None
         buffer = sample.get_buffer()
         _, map_info = buffer.map(Gst.MapFlags.READ)
+        # np.ndarray(..., map_info.data) is a VIEW over the mmap. If we return
+        # it after buffer.unmap(), the ndarray points at freed memory and TIDL
+        # reads whatever landed there — silent corruption. .copy() materialises
+        # the data before we release the buffer.
         if layout == "NHWC":
-            frame = np.ndarray((1, height, width, 3), data_type, map_info.data)
+            frame = np.ndarray((1, height, width, 3), data_type, map_info.data).copy()
         elif layout == "NCHW":
-            frame = np.ndarray((1, 3, height, width), data_type, map_info.data)
+            frame = np.ndarray((1, 3, height, width), data_type, map_info.data).copy()
         buffer.unmap(map_info)
 
         return frame
 
-    def push_frame(self, frame, sink):
+    def push_frame(self, frame, sink, pts=None, duration=None,
+                   frame_id=None, fps=None):
         """
-        Push a frame from gst pipeline
+        Push a frame to a gst appsrc.
+
+        Preferred: pass `pts` (and optionally `duration`) taken directly from
+        the source buffer via pull_frame(). This preserves the source's
+        timeline in the muxer, so output duration matches source duration
+        even when some frames are dropped upstream.
+
+        Fallback: pass `frame_id` + `fps` to synthesise a monotonic PTS at
+        1/fps spacing — used when no source PTS is available.
         Args:
-            frame: output frame to be pushed
-            sink: gst sink element to which the frame is pushed
+            frame:    output ndarray to be pushed.
+            sink:     gst appsrc element to push into.
+            pts:      GstClockTime (ns) or None; overrides frame_id/fps.
+            duration: GstClockTime (ns) or None.
+            frame_id: legacy — synthesises PTS from index × 1/fps.
+            fps:      legacy — Fraction or numeric framerate.
         """
         buffer = Gst.Buffer.new_wrapped(frame.tobytes())
+
+        if pts is not None:
+            buffer.pts = int(pts)
+            buffer.dts = int(pts)
+            if duration is not None:
+                buffer.duration = int(duration)
+        elif frame_id is not None and fps is not None:
+            try:
+                fps_num = int(fps.numerator)
+                fps_den = int(fps.denominator)
+            except AttributeError:
+                fps_num = int(fps)
+                fps_den = 1
+
+            if fps_num > 0:
+                syn_duration = Gst.util_uint64_scale_int(
+                    Gst.SECOND, fps_den, fps_num
+                )
+                syn_pts = int(frame_id) * syn_duration
+                buffer.pts = syn_pts
+                buffer.dts = syn_pts
+                buffer.duration = syn_duration
+
         sink.push_buffer(buffer)
 
     def send_eos(self, sink):
@@ -163,6 +221,59 @@ class GstPipe:
             sink: gst sink element to which EOS is sent
         """
         sink.end_of_stream()
+
+    def set_hw_roi(self, sub_flow, roi):
+        """
+        Apply a hardware ROI crop to the multiscaler src pad feeding this
+        sub_flow's DL branch.
+
+        Args:
+            sub_flow: SubFlow whose DL branch to crop.
+            roi:      ROIParameters with normalised x_left / y_top / width / height.
+
+        Property names below are the ones the tiovxmultiscaler plugin exposes
+        per src pad — verify on the board with:
+            gst-inspect-1.0 tiovxmultiscaler
+        Some SDK builds name them "crop-*" (crop-startx / crop-starty / crop-w /
+        crop-h). Adjust here if gst-inspect reports different names.
+        """
+        if sub_flow.gst_dl_scaler_pad_name is None:
+            # Non-multiscaler path (is_multi_scaler == False): nothing to crop.
+            return
+
+        scaler = self.src_pipe[sub_flow.flow.id].get_by_name(
+            sub_flow.gst_scaler_name
+        )
+        if scaler is None:
+            return
+        pad = sub_flow.gst_dl_scaler_pad_name
+
+        x = int(roi.x_left * sub_flow.input.width)
+        y = int(roi.y_top  * sub_flow.input.height)
+        w = int(roi.width  * sub_flow.input.width)
+        h = int(roi.height * sub_flow.input.height)
+
+        # tiovxmultiscaler is downscale-only with a 4x limit per axis. Clamp
+        # the ROI size into [model.crop, 4*model.crop]. Also cap by the frame
+        # bounds; ROI < model.crop would be an upscale, ROI > 4*model.crop
+        # would exceed the SoC's single-stage downscale limit — both refuse
+        # to negotiate and stall the tensor pull.
+        cw, ch = sub_flow.model.crop
+        w = max(cw, min(4 * cw, w, sub_flow.input.width))
+        h = max(ch, min(4 * ch, h, sub_flow.input.height))
+        x = max(0, min(sub_flow.input.width  - w, x))
+        y = max(0, min(sub_flow.input.height - h, y))
+
+        # NV12 / VPAC HW expects even values on both origin and size.
+        x &= ~1
+        y &= ~1
+        w &= ~1
+        h &= ~1
+
+        Gst.ChildProxy.set_property(scaler, "%s::roi-startx" % pad, x)
+        Gst.ChildProxy.set_property(scaler, "%s::roi-starty" % pad, y)
+        Gst.ChildProxy.set_property(scaler, "%s::roi-width"  % pad, w)
+        Gst.ChildProxy.set_property(scaler, "%s::roi-height" % pad, h)
 
     def free(self):
         """
@@ -852,6 +963,20 @@ def get_dl_scaler_elements(flow, is_multi_src):
         input: input configuration
         is_multi_src: Does the scaler element used supports multiple src pads
     """
+    if HARDWARE_ROI and ROI_RESIZE_MODE == "direct":
+        # Hardware ROI direct mode: crop + downscale in one multiscaler stage.
+        # The intermediate ">4x downscale" stage that the classic path adds
+        # would size split_N's DL src pad to the pre_proc_resize dims — but
+        # then a small runtime ROI would ask the first multiscaler to upscale
+        # (multiscaler is downscale-only). Skip it entirely; set_hw_roi()
+        # clamps runtime ROI into [model.crop, 4*model.crop] on each axis so
+        # this single stage always sees a valid 1x-4x downscale.
+        resize = flow.model.crop
+        dl_scaler_caps = "video/x-raw, width=%d, height=%d" % tuple(resize)
+        if is_multi_src == False:
+            return make_element(gst_element_map["scaler"], caps=dl_scaler_caps)
+        return make_element("queue", caps=dl_scaler_caps)
+
     resize = flow.pre_proc_resize
     dl_scaler_caps = "video/x-raw, width=%d, height=%d" % tuple(resize)
     scale_element = None
@@ -1074,7 +1199,12 @@ def get_pre_proc_elements(flow):
     global preproc_target_idx
     pre_proc_element_list = []
 
-    if flow.model.task_type == "classification":
+    # In hardware ROI direct mode the scaler has already produced a buffer at
+    # exactly the model input size, so the static videobox crop is a no-op —
+    # skip it entirely (the hardware scaler crop IS the crop).
+    hw_roi_direct = HARDWARE_ROI and ROI_RESIZE_MODE == "direct"
+
+    if flow.model.task_type == "classification" and not hw_roi_direct:
         left = (flow.pre_proc_resize[0] - flow.model.crop[0]) // 2
         right = flow.pre_proc_resize[0] - flow.model.crop[0] - left
         top = (flow.pre_proc_resize[1] - flow.model.crop[1]) // 2
@@ -1082,7 +1212,7 @@ def get_pre_proc_elements(flow):
         property = {"left": left, "right": right, "top": top, "bottom": bottom}
         element = make_element("videobox", property=property)
         pre_proc_element_list += element
-    elif flow.model.task_type == "lane_detection":
+    elif flow.model.task_type == "lane_detection" and not hw_roi_direct:
         left = (flow.pre_proc_resize[0] - flow.model.crop[0]) // 2
         right = flow.pre_proc_resize[0] - flow.model.crop[0] - left
         # ModelConfig doesn't expose crop_align (unknown to it for this task
@@ -1206,7 +1336,11 @@ def get_post_proc_elements(flow):
     property = {
         "format": 3,
         "block": True,
-        "do-timestamp": True,
+        # do-timestamp=False so appsrc honours the PTS InferPipe attaches
+        # on push_frame(). PTS comes from the source buffer via pull_frame,
+        # so output duration matches source duration even when frames drop
+        # upstream. True would overwrite it with wall-clock time.
+        "do-timestamp": False,
         "name": flow.gst_post_sink_name,
     }
 
@@ -1550,6 +1684,15 @@ def get_gst_pipe(flows, outputs):
                 link_elements(last_inp_element, gst_scaler_elements[0])
                 link_elements(gst_scaler_elements[-1], sensor[0])
                 link_elements(gst_scaler_elements[-1], dl[0])
+
+                # Capture which multiscaler src pad feeds this DL branch — the
+                # ROI generator sets crop-startx/y/w/h on this pad at runtime
+                # (needed for hardware_roi / shared_roi_for_models modes).
+                dl_sink_pad = dl[0].get_static_pad("sink")
+                dl_src_pad = dl_sink_pad.get_peer() if dl_sink_pad else None
+                s.gst_dl_scaler_pad_name = (
+                    dl_src_pad.get_name() if dl_src_pad else None
+                )
 
         src_players.append(gst_player)
 
